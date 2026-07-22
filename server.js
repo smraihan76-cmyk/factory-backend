@@ -78,6 +78,43 @@ async function initDb() {
     );
   `);
 
+  // কারিগরের প্রোডাকশন এন্ট্রি (কে, কোন প্রোডাক্ট, কত পিস, কত টাকা)
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS production_entries (
+      id SERIAL PRIMARY KEY,
+      staff_id INTEGER NOT NULL REFERENCES staff(id) ON DELETE CASCADE,
+      product_id INTEGER NOT NULL REFERENCES products(id) ON DELETE CASCADE,
+      quantity NUMERIC NOT NULL,
+      sewing_price NUMERIC NOT NULL,
+      amount NUMERIC NOT NULL,
+      entry_date DATE DEFAULT CURRENT_DATE,
+      created_at TIMESTAMP DEFAULT NOW()
+    );
+  `);
+
+  // ফ্যাক্টরির সাধারণ খরচ
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS expenses (
+      id SERIAL PRIMARY KEY,
+      description TEXT NOT NULL,
+      amount NUMERIC NOT NULL,
+      expense_date DATE DEFAULT CURRENT_DATE,
+      created_at TIMESTAMP DEFAULT NOW()
+    );
+  `);
+
+  // স্টাফ/কারিগরকে দেওয়া সাপ্তাহিক এডভান্স/পেমেন্ট
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS staff_payments (
+      id SERIAL PRIMARY KEY,
+      staff_id INTEGER NOT NULL REFERENCES staff(id) ON DELETE CASCADE,
+      amount NUMERIC NOT NULL,
+      payment_date DATE DEFAULT CURRENT_DATE,
+      note TEXT,
+      created_at TIMESTAMP DEFAULT NOW()
+    );
+  `);
+
   console.log('সব টেবিল রেডি ✅');
 }
 initDb().catch((err) => console.error('DB init error:', err.message));
@@ -501,6 +538,156 @@ app.delete('/api/products/:id', async (req, res) => {
     const { id } = req.params;
     await pool.query(`UPDATE products SET active = false WHERE id = $1`, [id]);
     res.json({ status: 'ok' });
+  } catch (err) {
+    res.status(500).json({ status: 'error', message: err.message });
+  }
+});
+
+// ==================== কারিগরের প্রোডাকশন এন্ট্রি ====================
+
+// নতুন প্রোডাকশন এন্ট্রি (কে, কোন প্রোডাক্ট, কত পিস) — অটো ক্যালকুলেশন
+app.post('/api/production', async (req, res) => {
+  try {
+    const { staff_id, product_id, quantity, entry_date } = req.body;
+    if (!staff_id || !product_id || !quantity) {
+      return res.status(400).json({ status: 'error', message: 'staff_id, product_id, quantity দরকার' });
+    }
+    const productResult = await pool.query(`SELECT * FROM products WHERE id = $1`, [product_id]);
+    if (productResult.rows.length === 0) {
+      return res.status(404).json({ status: 'error', message: 'প্রোডাক্ট পাওয়া যায়নি' });
+    }
+    const sewingPrice = parseFloat(productResult.rows[0].sewing_price);
+    const amount = sewingPrice * parseFloat(quantity);
+
+    const result = await pool.query(
+      `INSERT INTO production_entries (staff_id, product_id, quantity, sewing_price, amount, entry_date)
+       VALUES ($1, $2, $3, $4, $5, COALESCE($6, CURRENT_DATE))
+       RETURNING *`,
+      [staff_id, product_id, quantity, sewingPrice, amount, entry_date || null]
+    );
+    res.json({ status: 'ok', entry: result.rows[0] });
+  } catch (err) {
+    res.status(500).json({ status: 'error', message: err.message });
+  }
+});
+
+// একজন কারিগরের সব প্রোডাকশন এন্ট্রি (প্রোডাক্টের নামসহ)
+app.get('/api/production/staff/:staffId', async (req, res) => {
+  try {
+    const { staffId } = req.params;
+    const result = await pool.query(
+      `SELECT pe.*, p.name AS product_name
+       FROM production_entries pe
+       JOIN products p ON p.id = pe.product_id
+       WHERE pe.staff_id = $1
+       ORDER BY pe.entry_date DESC, pe.created_at DESC`,
+      [staffId]
+    );
+    res.json({ status: 'ok', entries: result.rows });
+  } catch (err) {
+    res.status(500).json({ status: 'error', message: err.message });
+  }
+});
+
+// একজন কারিগরের মোট প্রোডাকশন সামারি (মোট পিস, মোট টাকা)
+app.get('/api/production/staff/:staffId/summary', async (req, res) => {
+  try {
+    const { staffId } = req.params;
+    const result = await pool.query(
+      `SELECT COALESCE(SUM(quantity),0) AS total_quantity, COALESCE(SUM(amount),0) AS total_amount
+       FROM production_entries WHERE staff_id = $1`,
+      [staffId]
+    );
+    res.json({ status: 'ok', summary: result.rows[0] });
+  } catch (err) {
+    res.status(500).json({ status: 'error', message: err.message });
+  }
+});
+
+// সব কারিগরের প্রোডাকশন সামারি একসাথে (স্টাফ লিস্টে দেখানোর জন্য, বারবার কল করা এড়াতে)
+app.get('/api/production/summary-all', async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT staff_id, COALESCE(SUM(quantity),0) AS total_quantity, COALESCE(SUM(amount),0) AS total_amount
+       FROM production_entries GROUP BY staff_id`
+    );
+    res.json({ status: 'ok', summary: result.rows });
+  } catch (err) {
+    res.status(500).json({ status: 'error', message: err.message });
+  }
+});
+
+// ==================== ফ্যাক্টরি খরচ (Expenses) ====================
+
+app.get('/api/expenses', async (req, res) => {
+  try {
+    const result = await pool.query(`SELECT * FROM expenses ORDER BY expense_date DESC, created_at DESC LIMIT 100`);
+    res.json({ status: 'ok', expenses: result.rows });
+  } catch (err) {
+    res.status(500).json({ status: 'error', message: err.message });
+  }
+});
+
+app.post('/api/expenses', async (req, res) => {
+  try {
+    const { description, amount, expense_date } = req.body;
+    if (!description || !amount) {
+      return res.status(400).json({ status: 'error', message: 'বিবরণ এবং টাকার পরিমাণ দিতে হবে' });
+    }
+    const result = await pool.query(
+      `INSERT INTO expenses (description, amount, expense_date) VALUES ($1, $2, COALESCE($3, CURRENT_DATE)) RETURNING *`,
+      [description, amount, expense_date || null]
+    );
+    res.json({ status: 'ok', expense: result.rows[0] });
+  } catch (err) {
+    res.status(500).json({ status: 'error', message: err.message });
+  }
+});
+
+// ==================== স্টাফ/কারিগরের সাপ্তাহিক পেমেন্ট (Advance) ====================
+
+app.post('/api/staff-payments', async (req, res) => {
+  try {
+    const { staff_id, amount, payment_date, note } = req.body;
+    if (!staff_id || !amount) {
+      return res.status(400).json({ status: 'error', message: 'staff_id এবং টাকার পরিমাণ দিতে হবে' });
+    }
+    const result = await pool.query(
+      `INSERT INTO staff_payments (staff_id, amount, payment_date, note)
+       VALUES ($1, $2, COALESCE($3, CURRENT_DATE), $4)
+       RETURNING *`,
+      [staff_id, amount, payment_date || null, note || null]
+    );
+    res.json({ status: 'ok', payment: result.rows[0] });
+  } catch (err) {
+    res.status(500).json({ status: 'error', message: err.message });
+  }
+});
+
+// একজন স্টাফের সব পেমেন্ট হিস্ট্রি
+app.get('/api/staff-payments/staff/:staffId', async (req, res) => {
+  try {
+    const { staffId } = req.params;
+    const result = await pool.query(
+      `SELECT * FROM staff_payments WHERE staff_id = $1 ORDER BY payment_date DESC, created_at DESC`,
+      [staffId]
+    );
+    res.json({ status: 'ok', payments: result.rows });
+  } catch (err) {
+    res.status(500).json({ status: 'error', message: err.message });
+  }
+});
+
+// একজন স্টাফের মোট পেমেন্ট সামারি
+app.get('/api/staff-payments/staff/:staffId/summary', async (req, res) => {
+  try {
+    const { staffId } = req.params;
+    const result = await pool.query(
+      `SELECT COALESCE(SUM(amount),0) AS total_paid, COUNT(*) AS payment_count
+       FROM staff_payments WHERE staff_id = $1`,
+      [staffId]
+    );
+    res.json({ status: 'ok', summary: result.rows[0] });
   } catch (err) {
     res.status(500).json({ status: 'error', message: err.message });
   }
