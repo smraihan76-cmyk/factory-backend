@@ -12,7 +12,7 @@ const pool = new Pool({
   ssl: { rejectUnauthorized: false }
 });
 
-// প্রথমবার সার্ভার চালু হলে staff টেবিল তৈরি হবে (যদি না থাকে)
+// প্রথমবার সার্ভার চালু হলে টেবিলগুলো তৈরি হবে (যদি না থাকে)
 async function initDb() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS staff (
@@ -27,7 +27,44 @@ async function initDb() {
       created_at TIMESTAMP DEFAULT NOW()
     );
   `);
-  console.log('staff টেবিল রেডি ✅');
+
+  // উপস্থিতির প্রতিটা ঘটনা (check_in, break_start, break_end, check_out) এখানে জমা হয়
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS attendance_events (
+      id SERIAL PRIMARY KEY,
+      staff_id INTEGER NOT NULL REFERENCES staff(id) ON DELETE CASCADE,
+      event_type TEXT NOT NULL,
+      event_time TIMESTAMP NOT NULL DEFAULT NOW(),
+      source TEXT NOT NULL DEFAULT 'manual',
+      created_at TIMESTAMP DEFAULT NOW()
+    );
+  `);
+
+  // ডিউটি টাইম (পুরো ফ্যাক্টরির জন্য একটাই শিডিউল, একটাই রো থাকবে id=1)
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS duty_schedule (
+      id INTEGER PRIMARY KEY DEFAULT 1,
+      duty_start TIME NOT NULL DEFAULT '09:00',
+      lunch_start TIME NOT NULL DEFAULT '13:00',
+      lunch_end TIME NOT NULL DEFAULT '14:00',
+      duty_end TIME NOT NULL DEFAULT '18:00',
+      updated_at TIMESTAMP DEFAULT NOW()
+    );
+  `);
+
+  // ফিঙ্গারপ্রিন্ট মেশিনের তালিকা
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS machines (
+      id SERIAL PRIMARY KEY,
+      name TEXT NOT NULL,
+      ip_address TEXT NOT NULL,
+      port INTEGER NOT NULL DEFAULT 4370,
+      active BOOLEAN DEFAULT true,
+      created_at TIMESTAMP DEFAULT NOW()
+    );
+  `);
+
+  console.log('সব টেবিল রেডি ✅');
 }
 initDb().catch((err) => console.error('DB init error:', err.message));
 
@@ -103,6 +140,294 @@ app.delete('/api/staff/:id', async (req, res) => {
     const { id } = req.params;
     await pool.query(`UPDATE staff SET active = false WHERE id = $1`, [id]);
     res.json({ status: 'ok' });
+  } catch (err) {
+    res.status(500).json({ status: 'error', message: err.message });
+  }
+});
+
+// ==================== উপস্থিতি (Attendance) ====================
+
+// আজকে একজন স্টাফের ঘটনাগুলো বের করে সাহায্যকারী ফাংশন
+async function getTodayEvents(staffId) {
+  const result = await pool.query(
+    `SELECT * FROM attendance_events
+     WHERE staff_id = $1 AND event_time::date = CURRENT_DATE
+     ORDER BY event_time ASC`,
+    [staffId]
+  );
+  return result.rows;
+}
+
+// পরবর্তী ইভেন্ট কী হবে সেটা ঠিক করে (present বাটনের টগল লজিক)
+function nextPresentEventType(todayEvents) {
+  if (todayEvents.length === 0) return 'check_in';
+  const last = todayEvents[todayEvents.length - 1].event_type;
+  if (last === 'check_in') return 'check_out';
+  if (last === 'break_start') return 'break_end';
+  if (last === 'break_end') return 'check_out';
+  if (last === 'check_out') return 'check_in'; // নতুন সেশন (বিরল)
+  return 'check_in';
+}
+
+// "উপস্থিত যুক্ত করুন" — check_in / break_end (resume) / check_out অটো টগল হয়
+app.post('/api/attendance/present', async (req, res) => {
+  try {
+    const { staff_id, event_time, source } = req.body;
+    if (!staff_id) {
+      return res.status(400).json({ status: 'error', message: 'staff_id দরকার' });
+    }
+    const todayEvents = await getTodayEvents(staff_id);
+    const eventType = nextPresentEventType(todayEvents);
+    const result = await pool.query(
+      `INSERT INTO attendance_events (staff_id, event_type, event_time, source)
+       VALUES ($1, $2, COALESCE($3, NOW()), $4)
+       RETURNING *`,
+      [staff_id, eventType, event_time || null, source || 'manual']
+    );
+    res.json({ status: 'ok', event: result.rows[0] });
+  } catch (err) {
+    res.status(500).json({ status: 'error', message: err.message });
+  }
+});
+
+// "বিরতি" — শুধু তখনই বৈধ যখন স্টাফ বর্তমানে উপস্থিত (check_in বা break_end এর পরে)
+app.post('/api/attendance/break', async (req, res) => {
+  try {
+    const { staff_id, event_time, source } = req.body;
+    if (!staff_id) {
+      return res.status(400).json({ status: 'error', message: 'staff_id দরকার' });
+    }
+    const todayEvents = await getTodayEvents(staff_id);
+    const last = todayEvents.length ? todayEvents[todayEvents.length - 1].event_type : null;
+    if (last !== 'check_in' && last !== 'break_end') {
+      return res.status(400).json({ status: 'error', message: 'স্টাফ এখন উপস্থিত অবস্থায় নেই, তাই বিরতি দেওয়া যাবে না' });
+    }
+    const result = await pool.query(
+      `INSERT INTO attendance_events (staff_id, event_type, event_time, source)
+       VALUES ($1, 'break_start', COALESCE($2, NOW()), $3)
+       RETURNING *`,
+      [staff_id, event_time || null, source || 'manual']
+    );
+    res.json({ status: 'ok', event: result.rows[0] });
+  } catch (err) {
+    res.status(500).json({ status: 'error', message: err.message });
+  }
+});
+
+// আজকের সব স্টাফের বর্তমান স্ট্যাটাস (উপস্থিত / বিরতিতে / চলে গেছে / মার্ক করা হয়নি)
+app.get('/api/attendance/today', async (req, res) => {
+  try {
+    const staffResult = await pool.query(`SELECT * FROM staff WHERE active = true ORDER BY name ASC`);
+    const eventsResult = await pool.query(
+      `SELECT * FROM attendance_events WHERE event_time::date = CURRENT_DATE ORDER BY event_time ASC`
+    );
+
+    const eventsByStaff = {};
+    for (const ev of eventsResult.rows) {
+      if (!eventsByStaff[ev.staff_id]) eventsByStaff[ev.staff_id] = [];
+      eventsByStaff[ev.staff_id].push(ev);
+    }
+
+    const list = staffResult.rows.map((s) => {
+      const events = eventsByStaff[s.id] || [];
+      const last = events.length ? events[events.length - 1] : null;
+      let status = 'not_marked';
+      if (last) {
+        if (last.event_type === 'check_in' || last.event_type === 'break_end') status = 'present';
+        else if (last.event_type === 'break_start') status = 'on_break';
+        else if (last.event_type === 'check_out') status = 'checked_out';
+      }
+      return {
+        staff_id: s.id,
+        name: s.name,
+        designation: s.designation,
+        phone: s.phone,
+        status,
+        last_event_time: last ? last.event_time : null,
+        events
+      };
+    });
+
+    res.json({ status: 'ok', staff: list });
+  } catch (err) {
+    res.status(500).json({ status: 'error', message: err.message });
+  }
+});
+
+// একজন স্টাফের গত ৩০ দিনের সামারি (উপস্থিত ঘণ্টা, ব্রেক ঘণ্টা, লেট, অনুপস্থিত দিন)
+app.get('/api/attendance/summary/:staffId', async (req, res) => {
+  try {
+    const { staffId } = req.params;
+    const days = parseInt(req.query.days) || 30;
+
+    const staffResult = await pool.query(`SELECT * FROM staff WHERE id = $1`, [staffId]);
+    if (staffResult.rows.length === 0) {
+      return res.status(404).json({ status: 'error', message: 'স্টাফ পাওয়া যায়নি' });
+    }
+    const staff = staffResult.rows[0];
+
+    const dutyResult = await pool.query(`SELECT * FROM duty_schedule WHERE id = 1`);
+    const duty = dutyResult.rows[0] || null;
+
+    const eventsResult = await pool.query(
+      `SELECT * FROM attendance_events
+       WHERE staff_id = $1 AND event_time >= CURRENT_DATE - ($2 || ' days')::interval
+       ORDER BY event_time ASC`,
+      [staffId, days]
+    );
+
+    // তারিখ অনুযায়ী গ্রুপ করা
+    const byDate = {};
+    for (const ev of eventsResult.rows) {
+      const d = ev.event_time.toISOString().slice(0, 10);
+      if (!byDate[d]) byDate[d] = [];
+      byDate[d].push(ev);
+    }
+
+    let totalPresentMs = 0;
+    let totalBreakMs = 0;
+    let totalLateMs = 0;
+    let presentDays = 0;
+
+    for (const date of Object.keys(byDate)) {
+      const events = byDate[date];
+      const checkIn = events.find((e) => e.event_type === 'check_in');
+      const checkOut = [...events].reverse().find((e) => e.event_type === 'check_out');
+      const breakStart = events.find((e) => e.event_type === 'break_start');
+      const breakEnd = events.find((e) => e.event_type === 'break_end');
+
+      if (checkIn) presentDays++;
+
+      if (breakStart && breakEnd) {
+        totalBreakMs += new Date(breakEnd.event_time) - new Date(breakStart.event_time);
+      }
+
+      if (checkIn && checkOut) {
+        let workedMs = new Date(checkOut.event_time) - new Date(checkIn.event_time);
+        if (breakStart && breakEnd) {
+          workedMs -= (new Date(breakEnd.event_time) - new Date(breakStart.event_time));
+        }
+        totalPresentMs += Math.max(0, workedMs);
+      }
+
+      if (checkIn && duty) {
+        const dutyStartToday = new Date(`${date}T${duty.duty_start}`);
+        const lateMs = new Date(checkIn.event_time) - dutyStartToday;
+        if (lateMs > 0) totalLateMs += lateMs;
+      }
+    }
+
+    // যোগদানের তারিখ থেকে হিসাব করে মোট কর্মদিবস বের করা (সর্বোচ্চ `days` দিন)
+    const joining = new Date(staff.joining_date);
+    const today = new Date();
+    const daysSinceJoining = Math.min(days, Math.max(1, Math.ceil((today - joining) / (1000 * 60 * 60 * 24)) + 1));
+    const absentDays = Math.max(0, daysSinceJoining - presentDays);
+
+    res.json({
+      status: 'ok',
+      summary: {
+        staff_id: staff.id,
+        name: staff.name,
+        present_days: presentDays,
+        absent_days: absentDays,
+        present_hours: +(totalPresentMs / 3600000).toFixed(1),
+        break_hours: +(totalBreakMs / 3600000).toFixed(1),
+        late_hours: +(totalLateMs / 3600000).toFixed(1)
+      }
+    });
+  } catch (err) {
+    res.status(500).json({ status: 'error', message: err.message });
+  }
+});
+
+// ==================== ডিউটি টাইম (Duty Schedule) ====================
+
+app.get('/api/duty-schedule', async (req, res) => {
+  try {
+    const result = await pool.query(`SELECT * FROM duty_schedule WHERE id = 1`);
+    res.json({ status: 'ok', schedule: result.rows[0] || null });
+  } catch (err) {
+    res.status(500).json({ status: 'error', message: err.message });
+  }
+});
+
+app.post('/api/duty-schedule', async (req, res) => {
+  try {
+    const { duty_start, lunch_start, lunch_end, duty_end } = req.body;
+    const result = await pool.query(
+      `INSERT INTO duty_schedule (id, duty_start, lunch_start, lunch_end, duty_end, updated_at)
+       VALUES (1, $1, $2, $3, $4, NOW())
+       ON CONFLICT (id) DO UPDATE SET
+         duty_start = EXCLUDED.duty_start,
+         lunch_start = EXCLUDED.lunch_start,
+         lunch_end = EXCLUDED.lunch_end,
+         duty_end = EXCLUDED.duty_end,
+         updated_at = NOW()
+       RETURNING *`,
+      [duty_start, lunch_start, lunch_end, duty_end]
+    );
+    res.json({ status: 'ok', schedule: result.rows[0] });
+  } catch (err) {
+    res.status(500).json({ status: 'error', message: err.message });
+  }
+});
+
+// ==================== ফিঙ্গারপ্রিন্ট মেশিন (Machines) ====================
+
+app.get('/api/machines', async (req, res) => {
+  try {
+    const result = await pool.query(`SELECT * FROM machines WHERE active = true ORDER BY created_at DESC`);
+    res.json({ status: 'ok', machines: result.rows });
+  } catch (err) {
+    res.status(500).json({ status: 'error', message: err.message });
+  }
+});
+
+app.post('/api/machines', async (req, res) => {
+  try {
+    const { name, ip_address, port } = req.body;
+    if (!name || !ip_address) {
+      return res.status(400).json({ status: 'error', message: 'নাম এবং IP অ্যাড্রেস দরকার' });
+    }
+    const result = await pool.query(
+      `INSERT INTO machines (name, ip_address, port) VALUES ($1, $2, $3) RETURNING *`,
+      [name, ip_address, port || 4370]
+    );
+    res.json({ status: 'ok', machine: result.rows[0] });
+  } catch (err) {
+    res.status(500).json({ status: 'error', message: err.message });
+  }
+});
+
+app.delete('/api/machines/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    await pool.query(`UPDATE machines SET active = false WHERE id = $1`, [id]);
+    res.json({ status: 'ok' });
+  } catch (err) {
+    res.status(500).json({ status: 'error', message: err.message });
+  }
+});
+
+// মেশিন থেকে সিঙ্ক প্রোগ্রাম এই রুটে ব্যাচ আকারে attendance log পাঠাবে
+// body: { machine_id, logs: [{ staff_id বা employee_no, event_type, event_time }, ...] }
+app.post('/api/attendance/machine-sync', async (req, res) => {
+  try {
+    const { logs } = req.body;
+    if (!Array.isArray(logs) || logs.length === 0) {
+      return res.status(400).json({ status: 'error', message: 'logs অ্যারে দরকার' });
+    }
+    let inserted = 0;
+    for (const log of logs) {
+      if (!log.staff_id || !log.event_type || !log.event_time) continue;
+      await pool.query(
+        `INSERT INTO attendance_events (staff_id, event_type, event_time, source)
+         VALUES ($1, $2, $3, 'machine')`,
+        [log.staff_id, log.event_type, log.event_time]
+      );
+      inserted++;
+    }
+    res.json({ status: 'ok', inserted });
   } catch (err) {
     res.status(500).json({ status: 'error', message: err.message });
   }
