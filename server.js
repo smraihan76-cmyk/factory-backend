@@ -764,6 +764,19 @@ app.get('/api/staff-payments/staff/:staffId/summary', async (req, res) => {
   }
 });
 
+// সব স্টাফের পেমেন্ট সামারি একসাথে (মোট ব্যালেন্স হিসাব করার জন্য)
+app.get('/api/staff-payments/summary-all', async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT staff_id, COALESCE(SUM(amount),0) AS total_paid
+       FROM staff_payments GROUP BY staff_id`
+    );
+    res.json({ status: 'ok', summary: result.rows });
+  } catch (err) {
+    res.status(500).json({ status: 'error', message: err.message });
+  }
+});
+
 app.get('/', (req, res) => {
   res.send('Factory Backend চলছে ✅');
 });
