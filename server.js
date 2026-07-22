@@ -23,10 +23,13 @@ async function initDb() {
       rate_type TEXT NOT NULL DEFAULT 'piece',
       rate_amount NUMERIC NOT NULL DEFAULT 0,
       joining_date DATE DEFAULT CURRENT_DATE,
+      machine_user_id TEXT,
       active BOOLEAN DEFAULT true,
       created_at TIMESTAMP DEFAULT NOW()
     );
   `);
+  // পুরনো staff টেবিলে column না থাকলে যোগ করে দেয় (already-deployed ডাটাবেজের জন্য নিরাপদ)
+  await pool.query(`ALTER TABLE staff ADD COLUMN IF NOT EXISTS machine_user_id TEXT;`);
 
   // উপস্থিতির প্রতিটা ঘটনা (check_in, break_start, break_end, check_out) এখানে জমা হয়
   await pool.query(`
@@ -64,6 +67,17 @@ async function initDb() {
     );
   `);
 
+  // প্রোডাক্ট লিস্ট (নাম + সেলাই মূল্য)
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS products (
+      id SERIAL PRIMARY KEY,
+      name TEXT NOT NULL,
+      sewing_price NUMERIC NOT NULL DEFAULT 0,
+      active BOOLEAN DEFAULT true,
+      created_at TIMESTAMP DEFAULT NOW()
+    );
+  `);
+
   console.log('সব টেবিল রেডি ✅');
 }
 initDb().catch((err) => console.error('DB init error:', err.message));
@@ -81,15 +95,15 @@ app.get('/api/health', async (req, res) => {
 // নতুন স্টাফ/কারিগর যোগ করুন
 app.post('/api/staff', async (req, res) => {
   try {
-    const { name, phone, designation, rate_type, rate_amount, joining_date } = req.body;
+    const { name, phone, designation, rate_type, rate_amount, joining_date, machine_user_id } = req.body;
     if (!name) {
       return res.status(400).json({ status: 'error', message: 'নাম দেওয়া বাধ্যতামূলক' });
     }
     const result = await pool.query(
-      `INSERT INTO staff (name, phone, designation, rate_type, rate_amount, joining_date)
-       VALUES ($1, $2, $3, $4, $5, COALESCE($6, CURRENT_DATE))
+      `INSERT INTO staff (name, phone, designation, rate_type, rate_amount, joining_date, machine_user_id)
+       VALUES ($1, $2, $3, $4, $5, COALESCE($6, CURRENT_DATE), $7)
        RETURNING *`,
-      [name, phone || null, designation || null, rate_type || 'piece', rate_amount || 0, joining_date || null]
+      [name, phone || null, designation || null, rate_type || 'piece', rate_amount || 0, joining_date || null, machine_user_id || null]
     );
     res.json({ status: 'ok', staff: result.rows[0] });
   } catch (err) {
@@ -113,17 +127,18 @@ app.get('/api/staff', async (req, res) => {
 app.put('/api/staff/:id', async (req, res) => {
   try {
     const { id } = req.params;
-    const { name, phone, designation, rate_type, rate_amount } = req.body;
+    const { name, phone, designation, rate_type, rate_amount, machine_user_id } = req.body;
     const result = await pool.query(
       `UPDATE staff SET
         name = COALESCE($1, name),
         phone = COALESCE($2, phone),
         designation = COALESCE($3, designation),
         rate_type = COALESCE($4, rate_type),
-        rate_amount = COALESCE($5, rate_amount)
-       WHERE id = $6
+        rate_amount = COALESCE($5, rate_amount),
+        machine_user_id = COALESCE($6, machine_user_id)
+       WHERE id = $7
        RETURNING *`,
-      [name, phone, designation, rate_type, rate_amount, id]
+      [name, phone, designation, rate_type, rate_amount, machine_user_id, id]
     );
     if (result.rows.length === 0) {
       return res.status(404).json({ status: 'error', message: 'স্টাফ পাওয়া যায়নি' });
@@ -428,6 +443,64 @@ app.post('/api/attendance/machine-sync', async (req, res) => {
       inserted++;
     }
     res.json({ status: 'ok', inserted });
+  } catch (err) {
+    res.status(500).json({ status: 'error', message: err.message });
+  }
+});
+
+// ==================== প্রোডাক্ট (Products) ====================
+
+app.get('/api/products', async (req, res) => {
+  try {
+    const result = await pool.query(`SELECT * FROM products WHERE active = true ORDER BY created_at DESC`);
+    res.json({ status: 'ok', products: result.rows });
+  } catch (err) {
+    res.status(500).json({ status: 'error', message: err.message });
+  }
+});
+
+app.post('/api/products', async (req, res) => {
+  try {
+    const { name, sewing_price } = req.body;
+    if (!name) {
+      return res.status(400).json({ status: 'error', message: 'প্রোডাক্টের নাম দিতে হবে' });
+    }
+    const result = await pool.query(
+      `INSERT INTO products (name, sewing_price) VALUES ($1, $2) RETURNING *`,
+      [name, sewing_price || 0]
+    );
+    res.json({ status: 'ok', product: result.rows[0] });
+  } catch (err) {
+    res.status(500).json({ status: 'error', message: err.message });
+  }
+});
+
+app.put('/api/products/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { name, sewing_price } = req.body;
+    const result = await pool.query(
+      `UPDATE products SET
+        name = COALESCE($1, name),
+        sewing_price = COALESCE($2, sewing_price)
+       WHERE id = $3
+       RETURNING *`,
+      [name, sewing_price, id]
+    );
+    if (result.rows.length === 0) {
+      return res.status(404).json({ status: 'error', message: 'প্রোডাক্ট পাওয়া যায়নি' });
+    }
+    res.json({ status: 'ok', product: result.rows[0] });
+  } catch (err) {
+    res.status(500).json({ status: 'error', message: err.message });
+  }
+});
+
+app.delete('/api/products/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    await pool.query(`UPDATE products SET active = false WHERE id = $1`, [id]);
+    res.json({ status: 'ok' });
   } catch (err) {
     res.status(500).json({ status: 'error', message: err.message });
   }
