@@ -221,6 +221,105 @@ function nextPresentEventType(todayEvents) {
   return 'check_in';
 }
 
+// মাসিক বেতনের কারিগরের সঠিক মজুরি হিসাব — শুক্রবার সাপ্তাহিক বন্ধ (পূর্ণ বেতনসহ),
+// উপস্থিত দিনের বেতন যোগ, লেট মিনিটের বেতন কাটা, অনুপস্থিত দিনের বেতন কাটা
+async function computeSalaryBreakdown(staffId, days) {
+  const staffResult = await pool.query(`SELECT * FROM staff WHERE id = $1`, [staffId]);
+  if (staffResult.rows.length === 0) return null;
+  const staff = staffResult.rows[0];
+
+  const dutyResult = await pool.query(`SELECT * FROM duty_schedule WHERE id = 1`);
+  const duty = dutyResult.rows[0] || null;
+
+  // ডিউটি টাইম থেকে দৈনিক কর্মঘণ্টা (মিনিটে) বের করা, না থাকলে ডিফল্ট ৮ ঘণ্টা
+  let workMinutes = 480;
+  if (duty) {
+    const toMinutes = (t) => {
+      const [h, m] = t.split(':').map(Number);
+      return h * 60 + m;
+    };
+    const dutyStart = toMinutes(duty.duty_start);
+    const dutyEnd = toMinutes(duty.duty_end);
+    const lunchStart = toMinutes(duty.lunch_start);
+    const lunchEnd = toMinutes(duty.lunch_end);
+    workMinutes = (dutyEnd - dutyStart) - Math.max(0, lunchEnd - lunchStart);
+    if (workMinutes <= 0) workMinutes = 480;
+  }
+
+  // মাস = ৩০ দিন ধরে দৈনিক রেট এবং মিনিট-রেট বের করা (প্রচলিত হিসাব পদ্ধতি)
+  const dailyRate = parseFloat(staff.rate_amount || 0) / 30;
+  const perMinuteRate = dailyRate / workMinutes;
+
+  const eventsResult = await pool.query(
+    `SELECT * FROM attendance_events
+     WHERE staff_id = $1 AND event_time >= CURRENT_DATE - ($2 || ' days')::interval
+     ORDER BY event_time ASC`,
+    [staffId, days]
+  );
+  const byDate = {};
+  for (const ev of eventsResult.rows) {
+    const d = ev.event_time.toISOString().slice(0, 10);
+    if (!byDate[d]) byDate[d] = [];
+    byDate[d].push(ev);
+  }
+
+  const joining = new Date(staff.joining_date);
+  const rangeStart = new Date();
+  rangeStart.setDate(rangeStart.getDate() - (days - 1));
+  const startDate = joining > rangeStart ? joining : rangeStart;
+
+  const breakdown = [];
+  let totalEarned = 0;
+
+  for (let d = new Date(startDate); d <= new Date(); d.setDate(d.getDate() + 1)) {
+    const dateStr = d.toISOString().slice(0, 10);
+    const dayOfWeek = d.getDay(); // ৫ = শুক্রবার
+
+    if (dayOfWeek === 5) {
+      breakdown.push({ date: dateStr, status: 'holiday', late_minutes: 0, day_earned: +dailyRate.toFixed(2) });
+      totalEarned += dailyRate;
+      continue;
+    }
+
+    const events = byDate[dateStr] || [];
+    const checkIn = events.find((e) => e.event_type === 'check_in');
+
+    if (!checkIn) {
+      breakdown.push({ date: dateStr, status: 'absent', late_minutes: 0, day_earned: 0 });
+      continue;
+    }
+
+    let lateMinutes = 0;
+    if (duty) {
+      const dutyStartToday = new Date(`${dateStr}T${duty.duty_start}`);
+      const lateMs = new Date(checkIn.event_time) - dutyStartToday;
+      if (lateMs > 0) lateMinutes = Math.round(lateMs / 60000);
+    }
+
+    const dayEarned = Math.max(0, dailyRate - lateMinutes * perMinuteRate);
+    totalEarned += dayEarned;
+    breakdown.push({ date: dateStr, status: 'present', late_minutes: lateMinutes, day_earned: +dayEarned.toFixed(2) });
+  }
+
+  breakdown.reverse(); // সাম্প্রতিক তারিখ আগে
+
+  const paymentsResult = await pool.query(
+    `SELECT COALESCE(SUM(amount),0) AS total_paid FROM staff_payments WHERE staff_id = $1`,
+    [staffId]
+  );
+  const totalPaid = parseFloat(paymentsResult.rows[0].total_paid);
+
+  return {
+    staff_id: staff.id,
+    name: staff.name,
+    daily_rate: +dailyRate.toFixed(2),
+    total_salary_earned: +totalEarned.toFixed(2),
+    total_paid: totalPaid,
+    total_due: +(totalEarned - totalPaid).toFixed(2),
+    breakdown
+  };
+}
+
 // "উপস্থিত যুক্ত করুন" — check_in / break_end (resume) / check_out অটো টগল হয়
 app.post('/api/attendance/present', async (req, res) => {
   try {
@@ -772,6 +871,47 @@ app.get('/api/staff-payments/summary-all', async (req, res) => {
        FROM staff_payments GROUP BY staff_id`
     );
     res.json({ status: 'ok', summary: result.rows });
+  } catch (err) {
+    res.status(500).json({ status: 'error', message: err.message });
+  }
+});
+
+// ==================== মাসিক বেতনের কারিগরের মজুরি হিসাব ====================
+
+// একজন মাসিক বেতনের কারিগরের সম্পূর্ণ বিস্তারিত মজুরি হিসাব (ক্যাশ মেমোর জন্য)
+app.get('/api/salary/staff/:staffId/summary', async (req, res) => {
+  try {
+    const days = parseInt(req.query.days) || 30;
+    const result = await computeSalaryBreakdown(req.params.staffId, days);
+    if (!result) {
+      return res.status(404).json({ status: 'error', message: 'স্টাফ পাওয়া যায়নি' });
+    }
+    res.json({ status: 'ok', salary: result });
+  } catch (err) {
+    res.status(500).json({ status: 'error', message: err.message });
+  }
+});
+
+// সব মাসিক বেতনের কারিগরের মজুরি সামারি একসাথে (মোট ব্যালেন্স হিসাবের জন্য)
+app.get('/api/salary/summary-all', async (req, res) => {
+  try {
+    const days = parseInt(req.query.days) || 30;
+    const staffResult = await pool.query(
+      `SELECT id FROM staff WHERE active = true AND rate_type = 'monthly'`
+    );
+    const summaries = [];
+    for (const row of staffResult.rows) {
+      const s = await computeSalaryBreakdown(row.id, days);
+      if (s) {
+        summaries.push({
+          staff_id: s.staff_id,
+          total_salary_earned: s.total_salary_earned,
+          total_paid: s.total_paid,
+          total_due: s.total_due
+        });
+      }
+    }
+    res.json({ status: 'ok', summary: summaries });
   } catch (err) {
     res.status(500).json({ status: 'error', message: err.message });
   }
