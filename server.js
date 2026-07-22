@@ -392,7 +392,78 @@ app.get('/api/attendance/summary/:staffId', async (req, res) => {
   }
 });
 
-// ==================== ডিউটি টাইম (Duty Schedule) ====================
+// একজন স্টাফের দিন-ভিত্তিক উপস্থিতির বিস্তারিত লিস্ট (ক'টায় ঢুকল, ক'টায় বের হলো, লেট কত মিনিট, কোন দিন অনুপস্থিত)
+app.get('/api/attendance/daily/:staffId', async (req, res) => {
+  try {
+    const { staffId } = req.params;
+    const days = parseInt(req.query.days) || 30;
+
+    const staffResult = await pool.query(`SELECT * FROM staff WHERE id = $1`, [staffId]);
+    if (staffResult.rows.length === 0) {
+      return res.status(404).json({ status: 'error', message: 'স্টাফ পাওয়া যায়নি' });
+    }
+    const staff = staffResult.rows[0];
+
+    const dutyResult = await pool.query(`SELECT * FROM duty_schedule WHERE id = 1`);
+    const duty = dutyResult.rows[0] || null;
+
+    const eventsResult = await pool.query(
+      `SELECT * FROM attendance_events
+       WHERE staff_id = $1 AND event_time >= CURRENT_DATE - ($2 || ' days')::interval
+       ORDER BY event_time ASC`,
+      [staffId, days]
+    );
+
+    const byDate = {};
+    for (const ev of eventsResult.rows) {
+      const d = ev.event_time.toISOString().slice(0, 10);
+      if (!byDate[d]) byDate[d] = [];
+      byDate[d].push(ev);
+    }
+
+    // যোগদানের তারিখ বা `days` দিন আগে — যেটা পরে, সেখান থেকে আজ পর্যন্ত প্রতিটা দিন তৈরি করা
+    const joining = new Date(staff.joining_date);
+    const rangeStart = new Date();
+    rangeStart.setDate(rangeStart.getDate() - (days - 1));
+    const startDate = joining > rangeStart ? joining : rangeStart;
+
+    const result = [];
+    for (let d = new Date(startDate); d <= new Date(); d.setDate(d.getDate() + 1)) {
+      const dateStr = d.toISOString().slice(0, 10);
+      const events = byDate[dateStr] || [];
+      if (events.length === 0) {
+        result.push({ date: dateStr, status: 'absent' });
+        continue;
+      }
+      const checkIn = events.find((e) => e.event_type === 'check_in');
+      const checkOut = [...events].reverse().find((e) => e.event_type === 'check_out');
+      const breakStart = events.find((e) => e.event_type === 'break_start');
+      const breakEnd = events.find((e) => e.event_type === 'break_end');
+
+      let lateMinutes = 0;
+      if (checkIn && duty) {
+        const dutyStartToday = new Date(`${dateStr}T${duty.duty_start}`);
+        const lateMs = new Date(checkIn.event_time) - dutyStartToday;
+        if (lateMs > 0) lateMinutes = Math.round(lateMs / 60000);
+      }
+
+      result.push({
+        date: dateStr,
+        status: 'present',
+        check_in: checkIn ? checkIn.event_time : null,
+        check_out: checkOut ? checkOut.event_time : null,
+        break_start: breakStart ? breakStart.event_time : null,
+        break_end: breakEnd ? breakEnd.event_time : null,
+        late_minutes: lateMinutes
+      });
+    }
+
+    result.reverse(); // সাম্প্রতিক তারিখ আগে
+    res.json({ status: 'ok', days: result });
+  } catch (err) {
+    res.status(500).json({ status: 'error', message: err.message });
+  }
+});
 
 app.get('/api/duty-schedule', async (req, res) => {
   try {
