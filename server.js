@@ -1,0 +1,3510 @@
+const express = require('express');
+const cors = require('cors');
+const { Pool } = require('pg');
+require('dotenv').config();
+const ZKLib = require('node-zklib');
+const bcrypt = require('bcryptjs');
+const jwt = require('jsonwebtoken');
+const crypto = require('crypto');
+
+const app = express();
+app.use(cors());
+app.use(express.json({ limit: '15mb' })); // ছবি (base64) আপলোডের জন্য ডিফল্ট ১০০KB লিমিট বাড়ানো হলো
+// API রেসপন্স কোথাও ক্যাশ না হওয়ার জন্য — একাধিক ডিভাইসে পুরনো ডেটা দেখানোর সমস্যা এড়াতে
+app.use((req, res, next) => {
+  res.set('Cache-Control', 'no-store, no-cache, must-revalidate');
+  next();
+});
+
+const JWT_SECRET = process.env.JWT_SECRET || 'maya-garments-dev-secret-please-change';
+
+// ডিউটি শুরুর কত মিনিট পর্যন্ত দেরি হলে সেটাকে লেট ধরা হবে না (গ্রেস পিরিয়ড)
+const LATE_GRACE_MINUTES = 15;
+
+// মেশিনের ঘড়ি বাংলাদেশ সময়ে (UTC+৬) কিন্তু সার্ভার UTC-তে চলে বলে যে ৬ ঘণ্টার পার্থক্য হয়ে যায়, সেটা ঠিক করার জন্য
+const TIMEZONE_CORRECTION_MS = 6 * 60 * 60 * 1000;
+
+// একটা UTC Date/timestamp থেকে বাংলাদেশ ক্যালেন্ডার তারিখ (YYYY-MM-DD) বের করে —
+// রাত ১২টা থেকে ভোর ৬টার মধ্যে UTC আর বাংলাদেশ তারিখ আলাদা হয়ে যায়, তাই এই হেল্পার জরুরি
+function bdDateStr(date) {
+  return new Date(new Date(date).getTime() + TIMEZONE_CORRECTION_MS).toISOString().slice(0, 10);
+}
+
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: { rejectUnauthorized: false }
+});
+
+// প্রথমবার সার্ভার চালু হলে টেবিলগুলো তৈরি হবে (যদি না থাকে)
+async function initDb() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS staff (
+      id SERIAL PRIMARY KEY,
+      name TEXT NOT NULL,
+      phone TEXT,
+      designation TEXT,
+      rate_type TEXT NOT NULL DEFAULT 'piece',
+      rate_amount NUMERIC NOT NULL DEFAULT 0,
+      joining_date DATE DEFAULT CURRENT_DATE,
+      machine_user_id TEXT,
+      active BOOLEAN DEFAULT true,
+      created_at TIMESTAMP DEFAULT NOW()
+    );
+  `);
+  // পুরনো staff টেবিলে column না থাকলে যোগ করে দেয় (already-deployed ডাটাবেজের জন্য নিরাপদ)
+  await pool.query(`ALTER TABLE staff ADD COLUMN IF NOT EXISTS machine_user_id TEXT;`);
+
+  // উপস্থিতির প্রতিটা ঘটনা (check_in, break_start, break_end, check_out) এখানে জমা হয়
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS attendance_events (
+      id SERIAL PRIMARY KEY,
+      staff_id INTEGER NOT NULL REFERENCES staff(id) ON DELETE CASCADE,
+      event_type TEXT NOT NULL,
+      event_time TIMESTAMP NOT NULL DEFAULT NOW(),
+      source TEXT NOT NULL DEFAULT 'manual',
+      shift INTEGER,
+      created_at TIMESTAMP DEFAULT NOW()
+    );
+  `);
+  await pool.query(`ALTER TABLE attendance_events ADD COLUMN IF NOT EXISTS shift INTEGER;`);
+
+  // ডিউটি টাইম (পুরো ফ্যাক্টরির জন্য একটাই শিডিউল, একটাই রো থাকবে id=1)
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS duty_schedule (
+      id INTEGER PRIMARY KEY DEFAULT 1,
+      duty_start TIME NOT NULL DEFAULT '09:00',
+      lunch_start TIME NOT NULL DEFAULT '13:00',
+      lunch_end TIME NOT NULL DEFAULT '14:00',
+      duty_end TIME NOT NULL DEFAULT '18:00',
+      shift1_start TIME NOT NULL DEFAULT '09:00',
+      shift1_end TIME NOT NULL DEFAULT '14:00',
+      shift2_start TIME NOT NULL DEFAULT '15:00',
+      shift2_end TIME NOT NULL DEFAULT '22:00',
+      updated_at TIMESTAMP DEFAULT NOW()
+    );
+  `);
+  await pool.query(`ALTER TABLE duty_schedule ADD COLUMN IF NOT EXISTS shift1_start TIME NOT NULL DEFAULT '09:00';`);
+  await pool.query(`ALTER TABLE duty_schedule ADD COLUMN IF NOT EXISTS shift1_end TIME NOT NULL DEFAULT '14:00';`);
+  await pool.query(`ALTER TABLE duty_schedule ADD COLUMN IF NOT EXISTS shift2_start TIME NOT NULL DEFAULT '15:00';`);
+  await pool.query(`ALTER TABLE duty_schedule ADD COLUMN IF NOT EXISTS shift2_end TIME NOT NULL DEFAULT '22:00';`);
+
+  // ফিঙ্গারপ্রিন্ট মেশিনের তালিকা
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS machines (
+      id SERIAL PRIMARY KEY,
+      name TEXT NOT NULL,
+      ip_address TEXT NOT NULL,
+      port INTEGER NOT NULL DEFAULT 4370,
+      active BOOLEAN DEFAULT true,
+      last_synced_at TIMESTAMP,
+      created_at TIMESTAMP DEFAULT NOW()
+    );
+  `);
+  await pool.query(`ALTER TABLE machines ADD COLUMN IF NOT EXISTS last_synced_at TIMESTAMP;`);
+
+  // সাধারণ সেটিংস (যেমন মেশিন সিঙ্ক ইন্টারভাল)
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS settings (
+      key TEXT PRIMARY KEY,
+      value TEXT NOT NULL
+    );
+  `);
+  await pool.query(`
+    INSERT INTO settings (key, value) VALUES ('machine_sync_interval_seconds', '30')
+    ON CONFLICT (key) DO NOTHING;
+  `);
+
+  // ইউজার (এডমিন/মডারেটর) — লগইনের জন্য
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS users (
+      id SERIAL PRIMARY KEY,
+      name TEXT NOT NULL,
+      phone TEXT UNIQUE NOT NULL,
+      password_hash TEXT NOT NULL,
+      role TEXT NOT NULL DEFAULT 'moderator',
+      is_partner BOOLEAN DEFAULT false,
+      active BOOLEAN DEFAULT true,
+      created_at TIMESTAMP DEFAULT NOW()
+    );
+  `);
+  await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS is_partner BOOLEAN DEFAULT false;`);
+  await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS photo_url TEXT;`);
+  // প্রথম এডমিন অ্যাকাউন্ট — না থাকলে অটোমেটিক তৈরি হবে
+  const adminCheck = await pool.query(`SELECT id FROM users WHERE phone = '01775515571'`);
+  if (adminCheck.rows.length === 0) {
+    const hash = await bcrypt.hash('admin', 10);
+    await pool.query(
+      `INSERT INTO users (name, phone, password_hash, role) VALUES ('Admin', '01775515571', $1, 'admin')`,
+      [hash]
+    );
+    console.log('ডিফল্ট এডমিন অ্যাকাউন্ট তৈরি হলো ✅');
+  }
+
+  // পার্টনারের ক্যাশ/খরচের হিসাব
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS partner_transactions (
+      id SERIAL PRIMARY KEY,
+      user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      type TEXT NOT NULL,
+      description TEXT NOT NULL,
+      amount NUMERIC NOT NULL,
+      added_by_user_id INTEGER NOT NULL REFERENCES users(id),
+      image_url TEXT,
+      event_time TIMESTAMP DEFAULT NOW(),
+      created_at TIMESTAMP DEFAULT NOW()
+    );
+  `);
+  await pool.query(`ALTER TABLE partner_transactions ADD COLUMN IF NOT EXISTS image_url TEXT;`);
+
+  // পার্টনার নোটিফিকেশন (কে কী করলো সেটা অন্য পার্টনারদের জানানোর জন্য)
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS partner_notifications (
+      id SERIAL PRIMARY KEY,
+      user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      message TEXT NOT NULL,
+      is_read BOOLEAN DEFAULT false,
+      type TEXT DEFAULT 'info',
+      edit_request_id INTEGER,
+      created_at TIMESTAMP DEFAULT NOW()
+    );
+  `);
+  await pool.query(`ALTER TABLE partner_notifications ADD COLUMN IF NOT EXISTS type TEXT DEFAULT 'info';`);
+  await pool.query(`ALTER TABLE partner_notifications ADD COLUMN IF NOT EXISTS edit_request_id INTEGER;`);
+  await pool.query(`ALTER TABLE partner_notifications ADD COLUMN IF NOT EXISTS read_at TIMESTAMP;`);
+
+  // পোস্ট এডিট করলে সাথে সাথে বদলায় না — অন্য পার্টনারের অনুমোদন লাগে
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS partner_edit_requests (
+      id SERIAL PRIMARY KEY,
+      transaction_id INTEGER NOT NULL REFERENCES partner_transactions(id) ON DELETE CASCADE,
+      requested_by_user_id INTEGER NOT NULL REFERENCES users(id),
+      old_description TEXT,
+      old_amount NUMERIC,
+      old_image_url TEXT,
+      new_description TEXT,
+      new_amount NUMERIC,
+      new_image_url TEXT,
+      status TEXT DEFAULT 'pending',
+      resolved_by_user_id INTEGER REFERENCES users(id),
+      created_at TIMESTAMP DEFAULT NOW(),
+      resolved_at TIMESTAMP
+    );
+  `);
+
+  // পোস্টে লাইক/লাভ রিয়েক্ট — প্রতি ইউজার প্রতি পোস্টে একটাই রিয়েক্ট রাখতে পারবে
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS partner_transaction_reactions (
+      id SERIAL PRIMARY KEY,
+      transaction_id INTEGER NOT NULL REFERENCES partner_transactions(id) ON DELETE CASCADE,
+      user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      reaction_type TEXT NOT NULL,
+      created_at TIMESTAMP DEFAULT NOW(),
+      UNIQUE(transaction_id, user_id)
+    );
+  `);
+
+  // প্রোডাক্ট লিস্ট (নাম + সেলাই মূল্য)
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS products (
+      id SERIAL PRIMARY KEY,
+      name TEXT NOT NULL,
+      sewing_price NUMERIC NOT NULL DEFAULT 0,
+      active BOOLEAN DEFAULT true,
+      created_at TIMESTAMP DEFAULT NOW()
+    );
+  `);
+
+  // কারিগরের প্রোডাকশন এন্ট্রি (কে, কোন প্রোডাক্ট, কত পিস, কত টাকা)
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS production_entries (
+      id SERIAL PRIMARY KEY,
+      staff_id INTEGER NOT NULL REFERENCES staff(id) ON DELETE CASCADE,
+      product_id INTEGER NOT NULL REFERENCES products(id) ON DELETE CASCADE,
+      quantity NUMERIC NOT NULL,
+      sewing_price NUMERIC NOT NULL,
+      amount NUMERIC NOT NULL,
+      entry_date DATE DEFAULT CURRENT_DATE,
+      created_at TIMESTAMP DEFAULT NOW()
+    );
+  `);
+
+  // ফ্যাক্টরির সাধারণ খরচ
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS expenses (
+      id SERIAL PRIMARY KEY,
+      description TEXT NOT NULL,
+      amount NUMERIC NOT NULL,
+      expense_date DATE DEFAULT CURRENT_DATE,
+      created_at TIMESTAMP DEFAULT NOW()
+    );
+  `);
+
+  // স্টাফ/কারিগরকে দেওয়া সাপ্তাহিক এডভান্স/পেমেন্ট
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS staff_payments (
+      id SERIAL PRIMARY KEY,
+      staff_id INTEGER NOT NULL REFERENCES staff(id) ON DELETE CASCADE,
+      amount NUMERIC NOT NULL,
+      payment_date DATE DEFAULT CURRENT_DATE,
+      note TEXT,
+      created_at TIMESTAMP DEFAULT NOW()
+    );
+  `);
+
+  // ওভারটাইম সেশন — শুরু ও শেষের সময়, ঘণ্টা ও টাকা হিসাব
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS overtime_sessions (
+      id SERIAL PRIMARY KEY,
+      staff_id INTEGER NOT NULL REFERENCES staff(id) ON DELETE CASCADE,
+      start_time TIMESTAMP NOT NULL DEFAULT NOW(),
+      end_time TIMESTAMP,
+      hours NUMERIC,
+      amount NUMERIC,
+      created_at TIMESTAMP DEFAULT NOW()
+    );
+  `);
+
+  // পাইকার (হোলসেলার) লিস্ট
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS wholesalers (
+      id SERIAL PRIMARY KEY,
+      name TEXT NOT NULL,
+      address TEXT,
+      phone TEXT,
+      created_at TIMESTAMP DEFAULT NOW()
+    );
+  `);
+
+  // পাইকার-ভিত্তিক প্রোডাক্টের রেট
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS wholesaler_product_rates (
+      id SERIAL PRIMARY KEY,
+      wholesaler_id INTEGER NOT NULL REFERENCES wholesalers(id) ON DELETE CASCADE,
+      product_name TEXT NOT NULL,
+      price NUMERIC NOT NULL,
+      created_at TIMESTAMP DEFAULT NOW()
+    );
+  `);
+
+  // পাইকারি হিসাব — হিসাব যোগ / রিটার্ন / পেমেন্ট, সব এক লগে
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS wholesaler_ledger (
+      id SERIAL PRIMARY KEY,
+      wholesaler_id INTEGER NOT NULL REFERENCES wholesalers(id) ON DELETE CASCADE,
+      entry_type TEXT NOT NULL, -- 'add' | 'return' | 'payment'
+      product_name TEXT,
+      quantity NUMERIC,
+      price_per_unit NUMERIC,
+      amount NUMERIC NOT NULL,
+      description TEXT,
+      added_by_user_id INTEGER REFERENCES users(id),
+      event_time TIMESTAMP DEFAULT NOW(),
+      created_at TIMESTAMP DEFAULT NOW()
+    );
+  `);
+  await pool.query(`ALTER TABLE wholesaler_ledger ADD COLUMN IF NOT EXISTS added_by_user_id INTEGER REFERENCES users(id);`);
+
+  // স্টাফের আগের (পুরনো) হিসাব সমন্বয় — signed amount: পজিটিভ মানে কারিগর পাবে (পাওনা বাড়বে), নেগেটিভ মানে ফ্যাক্টরি পাবে (পাওনা কমবে)
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS staff_balance_adjustments (
+      id SERIAL PRIMARY KEY,
+      staff_id INTEGER NOT NULL REFERENCES staff(id) ON DELETE CASCADE,
+      amount NUMERIC NOT NULL,
+      note TEXT,
+      created_at TIMESTAMP DEFAULT NOW()
+    );
+  `);
+
+  // ==================== অর্ডার ম্যানেজমেন্ট (All Order + Pending) ====================
+
+  // মাল্টি-পেইজ/দোকান সাপোর্ট (এখন ১টা দিয়ে শুরু, পরে আরও যোগ করা যাবে)
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS order_pages (
+      id SERIAL PRIMARY KEY,
+      name TEXT NOT NULL
+    );
+  `);
+
+  // প্রতিটা পেইজের কুরিয়ার/AI API ক্রেডেনশিয়াল (না থাকলে .env থেকে ফলব্যাক হবে)
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS order_api_credentials (
+      id SERIAL PRIMARY KEY,
+      page_id INTEGER REFERENCES order_pages(id),
+      type TEXT NOT NULL,
+      provider TEXT NOT NULL,
+      api_key TEXT,
+      secret_key TEXT,
+      priority INTEGER DEFAULT 1,
+      created_at TIMESTAMP NOT NULL DEFAULT NOW()
+    );
+  `);
+
+  // মূল অর্ডার টেবিল — All Order / Pending / Emergency ইত্যাদি group_name দিয়ে আলাদা করা হয়, batch_id দিয়ে একই অর্ডারের কপিগুলো যুক্ত
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS order_entries (
+      id SERIAL PRIMARY KEY,
+      raw_text TEXT,
+      image_urls JSONB DEFAULT '[]',
+      moderator TEXT,
+      group_name TEXT NOT NULL,
+      batch_id UUID,
+      page_id INTEGER,
+      page_name TEXT,
+      status TEXT DEFAULT 'pending',
+      customer_phone TEXT,
+      customer_name TEXT,
+      customer_address TEXT,
+      consignment_id TEXT,
+      tracking_code TEXT,
+      amount NUMERIC,
+      courier_status TEXT,
+      courier_status_updated_at TIMESTAMP,
+      created_at TIMESTAMP NOT NULL DEFAULT NOW()
+    );
+  `);
+
+  // ডিলিট হওয়া অর্ডারের ব্যাকআপ (এখনো-না-পাঠানো অবস্থায় ডিলিট হলে)
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS order_recycle_bin (
+      id SERIAL PRIMARY KEY,
+      original_group TEXT,
+      raw_text TEXT,
+      image_urls JSONB,
+      moderator TEXT,
+      page_id INTEGER,
+      page_name TEXT,
+      status TEXT,
+      customer_phone TEXT,
+      delete_reason TEXT,
+      deleted_at TIMESTAMP NOT NULL DEFAULT NOW()
+    );
+  `);
+
+  // মডারেটরের প্রস্তাবিত এডিট — এডমিনের অনুমোদনের অপেক্ষায় থাকে
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS order_pending_edits (
+      id SERIAL PRIMARY KEY,
+      entry_id INTEGER REFERENCES order_entries(id) ON DELETE CASCADE,
+      submitted_by TEXT NOT NULL,
+      proposed_raw_text TEXT,
+      proposed_image_urls JSONB,
+      original_raw_text TEXT,
+      original_image_urls JSONB,
+      submitted_at TIMESTAMP NOT NULL DEFAULT NOW(),
+      UNIQUE (entry_id, submitted_by)
+    );
+  `);
+
+  // মডারেটরের ডিলিটের অনুরোধ — এডমিনের অনুমোদনের অপেক্ষায় থাকে
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS order_pending_deletes (
+      id SERIAL PRIMARY KEY,
+      entry_id INTEGER NOT NULL REFERENCES order_entries(id) ON DELETE CASCADE,
+      submitted_by TEXT NOT NULL,
+      submitted_at TIMESTAMP NOT NULL DEFAULT NOW(),
+      UNIQUE (entry_id)
+    );
+  `);
+
+  // ডিফল্ট একটা পেইজ (Maya Garments) সেট করা থাকবে, যদি একদম না থাকে
+  const pageCountResult = await pool.query(`SELECT COUNT(*) FROM order_pages`);
+  if (parseInt(pageCountResult.rows[0].count) === 0) {
+    await pool.query(`INSERT INTO order_pages (name) VALUES ('Maya Garments')`);
+  }
+
+  console.log('সব টেবিল রেডি ✅');
+}
+initDb().catch((err) => console.error('DB init error:', err.message));
+
+// Health check route
+app.get('/api/health', async (req, res) => {
+  try {
+    const result = await pool.query('SELECT NOW()');
+    res.json({ status: 'ok', time: result.rows[0].now });
+  } catch (err) {
+    res.status(500).json({ status: 'error', message: err.message });
+  }
+});
+
+// ==================== লগইন / ইউজার ম্যানেজমেন্ট ====================
+
+// লগইন — ফোন নাম্বার + পাসওয়ার্ড দিয়ে
+app.post('/api/auth/login', async (req, res) => {
+  try {
+    const { phone, password } = req.body;
+    if (!phone || !password) {
+      return res.status(400).json({ status: 'error', message: 'ফোন নাম্বার এবং পাসওয়ার্ড দিতে হবে' });
+    }
+    const result = await pool.query(`SELECT * FROM users WHERE phone = $1 AND active = true`, [phone]);
+    if (result.rows.length === 0) {
+      return res.status(401).json({ status: 'error', message: 'ফোন নাম্বার বা পাসওয়ার্ড ভুল' });
+    }
+    const user = result.rows[0];
+    const match = await bcrypt.compare(password, user.password_hash);
+    if (!match) {
+      return res.status(401).json({ status: 'error', message: 'ফোন নাম্বার বা পাসওয়ার্ড ভুল' });
+    }
+    const token = jwt.sign(
+      { id: user.id, phone: user.phone, role: user.role, name: user.name, is_partner: user.is_partner },
+      JWT_SECRET,
+      { expiresIn: '30d' }
+    );
+    res.json({
+      status: 'ok',
+      token,
+      user: {
+        id: user.id,
+        name: user.name,
+        phone: user.phone,
+        role: user.role,
+        is_partner: user.is_partner,
+        photo_url: user.photo_url
+      }
+    });
+  } catch (err) {
+    res.status(500).json({ status: 'error', message: err.message });
+  }
+});
+
+// এমপ্লয়ি/কারিগর লগইন — শুধু ফোন নাম্বার দিয়ে, পাসওয়ার্ড লাগবে না
+app.post('/api/staff-auth/login', async (req, res) => {
+  try {
+    const { phone } = req.body;
+    if (!phone) {
+      return res.status(400).json({ status: 'error', message: 'ফোন নাম্বার দিতে হবে' });
+    }
+    const result = await pool.query(`SELECT * FROM staff WHERE phone = $1 AND active = true`, [phone]);
+    if (result.rows.length === 0) {
+      return res.status(404).json({ status: 'error', message: 'এই নাম্বারে কোনো স্টাফ/কারিগর পাওয়া যায়নি' });
+    }
+    const staff = result.rows[0];
+    const token = jwt.sign(
+      { staffId: staff.id, phone: staff.phone, role: 'employee' },
+      JWT_SECRET,
+      { expiresIn: '365d' }
+    );
+    res.json({ status: 'ok', token, staff });
+  } catch (err) {
+    res.status(500).json({ status: 'error', message: err.message });
+  }
+});
+
+// নিজের প্রোফাইল আপডেট করুন — নাম, ছবি, পাসওয়ার্ড (যেকোনো লগইন করা ইউজার নিজের জন্য করতে পারবে)
+app.put('/api/auth/me', verifyAuth, async (req, res) => {
+  try {
+    const { name, photo_url, current_password, new_password } = req.body;
+
+    if (new_password) {
+      if (!current_password) {
+        return res.status(400).json({ status: 'error', message: 'বর্তমান পাসওয়ার্ড দিতে হবে' });
+      }
+      const existing = await pool.query(`SELECT password_hash FROM users WHERE id = $1`, [req.user.id]);
+      const match = await bcrypt.compare(current_password, existing.rows[0].password_hash);
+      if (!match) {
+        return res.status(400).json({ status: 'error', message: 'বর্তমান পাসওয়ার্ড ভুল' });
+      }
+      const newHash = await bcrypt.hash(new_password, 10);
+      await pool.query(`UPDATE users SET password_hash = $1 WHERE id = $2`, [newHash, req.user.id]);
+    }
+
+    const result = await pool.query(
+      `UPDATE users SET
+        name = COALESCE($1, name),
+        photo_url = COALESCE($2, photo_url)
+       WHERE id = $3
+       RETURNING id, name, phone, role, is_partner, photo_url`,
+      [name || null, photo_url || null, req.user.id]
+    );
+
+    res.json({ status: 'ok', user: result.rows[0] });
+  } catch (err) {
+    res.status(500).json({ status: 'error', message: err.message });
+  }
+});
+
+// JWT ভেরিফাই করে + শুধু এডমিনকে এগোতে দেয়
+function verifyAdmin(req, res, next) {
+  const authHeader = req.headers.authorization || '';
+  const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
+  if (!token) {
+    return res.status(401).json({ status: 'error', message: 'লগইন করা নেই' });
+  }
+  try {
+    const decoded = jwt.verify(token, JWT_SECRET);
+    if (decoded.role !== 'admin') {
+      return res.status(403).json({ status: 'error', message: 'শুধু এডমিন এই কাজ করতে পারবে' });
+    }
+    req.user = decoded;
+    next();
+  } catch (err) {
+    return res.status(401).json({ status: 'error', message: 'টোকেন সঠিক নয় বা মেয়াদ শেষ' });
+  }
+}
+
+// JWT ভেরিফাই করে — যেকোনো লগইন করা ইউজার (এডমিন/মডারেটর উভয়ই) এগোতে পারবে
+function verifyAuth(req, res, next) {
+  const authHeader = req.headers.authorization || '';
+  const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
+  if (!token) {
+    return res.status(401).json({ status: 'error', message: 'লগইন করা নেই' });
+  }
+  try {
+    const decoded = jwt.verify(token, JWT_SECRET);
+    req.user = decoded;
+    next();
+  } catch (err) {
+    return res.status(401).json({ status: 'error', message: 'টোকেন সঠিক নয় বা মেয়াদ শেষ' });
+  }
+}
+
+// এই মিডলওয়্যারে লগইন থাকা বাধ্যতামূলক না — টোকেন থাকলে req.user বসিয়ে দেয়, না থাকলেও রিকোয়েস্ট চলতে থাকে।
+// ফ্যাক্টরি খরচ/স্টাফ পেমেন্টের মতো রুটে ব্যবহার হয়, যাতে পার্টনার লগইন করা থাকলে তার হিসাবের সাথে অটো-লিংক করা যায়।
+function verifyAuthOptional(req, res, next) {
+  const authHeader = req.headers.authorization || '';
+  const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
+  if (token) {
+    try {
+      req.user = jwt.verify(token, JWT_SECRET);
+    } catch (err) {
+      req.user = null;
+    }
+  }
+  next();
+}
+
+// একজন পার্টনারের হিসাবে নতুন এন্ট্রি যোগ করে + অন্য পার্টনারদের নোটিফাই করে —
+// পার্টনার পেজ, ফ্যাক্টরি খরচ, স্টাফ পেমেন্ট — সব জায়গা থেকে এই একই ফাংশন ব্যবহার হবে (অটো-লিংকের জন্য)
+async function createPartnerTransaction({ userId, type, description, amount, addedByUserId, imageUrl }) {
+  const result = await pool.query(
+    `INSERT INTO partner_transactions (user_id, type, description, amount, added_by_user_id, image_url)
+     VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`,
+    [userId, type, description, amount, addedByUserId, imageUrl || null]
+  );
+  const adder = await pool.query(`SELECT name FROM users WHERE id = $1`, [addedByUserId]);
+  const adderName = adder.rows[0]?.name || 'কেউ একজন';
+  const label = type === 'expense' ? 'খরচ' : 'ক্যাশ';
+  const otherPartners = await pool.query(
+    `SELECT id FROM users WHERE is_partner = true AND active = true AND id != $1`,
+    [addedByUserId]
+  );
+  for (const p of otherPartners.rows) {
+    await pool.query(
+      `INSERT INTO partner_notifications (user_id, message) VALUES ($1, $2)`,
+      [p.id, `${adderName} নতুন ${label} যোগ করেছে: ${description} (৳${amount})`]
+    );
+  }
+  return result.rows[0];
+}
+
+// নতুন এডমিন/মডারেটর যোগ করুন — শুধু লগইন করা এডমিনই পারবে
+app.post('/api/auth/register', verifyAdmin, async (req, res) => {
+  try {
+    const { name, phone, password, role, is_partner } = req.body;
+    if (!name || !phone || !password) {
+      return res.status(400).json({ status: 'error', message: 'নাম, ফোন এবং পাসওয়ার্ড দিতে হবে' });
+    }
+    const existing = await pool.query(`SELECT id FROM users WHERE phone = $1`, [phone]);
+    if (existing.rows.length > 0) {
+      return res.status(400).json({ status: 'error', message: 'এই ফোন নাম্বার দিয়ে আগে থেকেই একটা অ্যাকাউন্ট আছে' });
+    }
+    const hash = await bcrypt.hash(password, 10);
+    const result = await pool.query(
+      `INSERT INTO users (name, phone, password_hash, role, is_partner) VALUES ($1, $2, $3, $4, $5)
+       RETURNING id, name, phone, role, is_partner, created_at`,
+      [name, phone, hash, role === 'admin' ? 'admin' : 'moderator', !!is_partner]
+    );
+    res.json({ status: 'ok', user: result.rows[0] });
+  } catch (err) {
+    res.status(500).json({ status: 'error', message: err.message });
+  }
+});
+
+// সব ইউজারের লিস্ট — শুধু এডমিন দেখতে পারবে
+app.get('/api/auth/users', verifyAdmin, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT id, name, phone, role, is_partner, photo_url, active, created_at FROM users WHERE active = true ORDER BY created_at DESC`
+    );
+    res.json({ status: 'ok', users: result.rows });
+  } catch (err) {
+    res.status(500).json({ status: 'error', message: err.message });
+  }
+});
+
+// একজন ইউজারকে নিষ্ক্রিয় করুন — শুধু এডমিন পারবে
+app.delete('/api/auth/users/:id', verifyAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    await pool.query(`UPDATE users SET active = false WHERE id = $1`, [id]);
+    res.json({ status: 'ok' });
+  } catch (err) {
+    res.status(500).json({ status: 'error', message: err.message });
+  }
+});
+
+// আগে থেকে থাকা ইউজারকে এডিট করুন (যেমন: পার্টনার হিসেবে যোগ করা) — শুধু এডমিন পারবে
+app.put('/api/auth/users/:id', verifyAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { name, role, is_partner } = req.body;
+    const result = await pool.query(
+      `UPDATE users SET
+        name = COALESCE($1, name),
+        role = COALESCE($2, role),
+        is_partner = COALESCE($3, is_partner)
+       WHERE id = $4
+       RETURNING id, name, phone, role, is_partner, active, created_at`,
+      [name || null, role || null, is_partner === undefined ? null : is_partner, id]
+    );
+    if (result.rows.length === 0) {
+      return res.status(404).json({ status: 'error', message: 'ইউজার পাওয়া যায়নি' });
+    }
+    res.json({ status: 'ok', user: result.rows[0] });
+  } catch (err) {
+    res.status(500).json({ status: 'error', message: err.message });
+  }
+});
+
+// সব পার্টনার হিসাব (এন্ট্রি + নোটিফিকেশন) মুছে ফেলুন — টেস্ট/ডেমো ডেটা পরিষ্কার করার জন্য
+app.delete('/api/partners/clear-all', verifyAdmin, async (req, res) => {
+  try {
+    const txnResult = await pool.query(`DELETE FROM partner_transactions`);
+    await pool.query(`DELETE FROM partner_notifications`);
+    res.json({ status: 'ok', deleted: txnResult.rowCount });
+  } catch (err) {
+    res.status(500).json({ status: 'error', message: err.message });
+  }
+});
+
+// ==================== পার্টনার হিসাব ====================
+
+// সব পার্টনারের নাম-লিস্ট
+app.get('/api/partners', async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT id, name, phone, photo_url FROM users WHERE is_partner = true AND active = true ORDER BY name ASC`
+    );
+    res.json({ status: 'ok', partners: result.rows });
+  } catch (err) {
+    res.status(500).json({ status: 'error', message: err.message });
+  }
+});
+
+// একজন পার্টনারের সব এন্ট্রি (যেকোনো লগইন করা ইউজার দেখতে পারবে)
+// একগুচ্ছ ট্রানজেকশনের সাথে রিয়েক্ট সামারি (কে কী রিয়েক্ট দিয়েছে, ভিউয়ারের নিজের রিয়েক্ট) জুড়ে দেয়
+async function attachReactions(transactions, viewerUserId) {
+  if (transactions.length === 0) return transactions;
+  const ids = transactions.map((t) => t.id);
+  const result = await pool.query(
+    `SELECT r.transaction_id, r.reaction_type, r.user_id, u.name AS user_name
+     FROM partner_transaction_reactions r
+     JOIN users u ON u.id = r.user_id
+     WHERE r.transaction_id = ANY($1)`,
+    [ids]
+  );
+  const byTxn = {};
+  for (const r of result.rows) {
+    if (!byTxn[r.transaction_id]) byTxn[r.transaction_id] = [];
+    byTxn[r.transaction_id].push(r);
+  }
+  return transactions.map((t) => {
+    const reactions = byTxn[t.id] || [];
+    const counts = {};
+    for (const r of reactions) counts[r.reaction_type] = (counts[r.reaction_type] || 0) + 1;
+    const mine = viewerUserId ? reactions.find((r) => r.user_id === viewerUserId) : null;
+    return {
+      ...t,
+      reaction_counts: counts,
+      my_reaction: mine ? mine.reaction_type : null,
+      reactors: reactions.map((r) => ({ user_name: r.user_name, reaction_type: r.reaction_type }))
+    };
+  });
+}
+
+app.get('/api/partners/:userId/transactions', verifyAuth, async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const result = await pool.query(
+      `SELECT pt.*, u.name AS added_by_name
+       FROM partner_transactions pt
+       JOIN users u ON u.id = pt.added_by_user_id
+       WHERE pt.user_id = $1
+       ORDER BY pt.event_time DESC, pt.created_at DESC`,
+      [userId]
+    );
+    const withReactions = await attachReactions(result.rows, req.user.id);
+    res.json({ status: 'ok', transactions: withReactions });
+  } catch (err) {
+    res.status(500).json({ status: 'error', message: err.message });
+  }
+});
+
+// একজন পার্টনারের সামারি (মোট ক্যাশ, মোট খরচ, বর্তমান ব্যালেন্স)
+app.get('/api/partners/:userId/summary', async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const result = await pool.query(
+      `SELECT
+         COALESCE(SUM(CASE WHEN type = 'cash_in' THEN amount ELSE 0 END), 0) AS total_cash_in,
+         COALESCE(SUM(CASE WHEN type = 'expense' THEN amount ELSE 0 END), 0) AS total_expense
+       FROM partner_transactions WHERE user_id = $1`,
+      [userId]
+    );
+    const row = result.rows[0];
+    const totalCashIn = parseFloat(row.total_cash_in);
+    const totalExpense = parseFloat(row.total_expense);
+    res.json({
+      status: 'ok',
+      summary: { total_cash_in: totalCashIn, total_expense: totalExpense, balance: totalCashIn - totalExpense }
+    });
+  } catch (err) {
+    res.status(500).json({ status: 'error', message: err.message });
+  }
+});
+
+// নতুন এন্ট্রি — শুধু নিজের লেজারেই যোগ করা যায় (user_id সবসময় লগইন করা ইউজারের নিজের আইডি)
+app.post('/api/partners/transactions', verifyAuth, async (req, res) => {
+  try {
+    const { type, description, amount, image_url } = req.body;
+    if (!type || !description || !amount) {
+      return res.status(400).json({ status: 'error', message: 'ধরন, বিবরণ এবং টাকার পরিমাণ দিতে হবে' });
+    }
+    if (type !== 'expense' && type !== 'cash_in') {
+      return res.status(400).json({ status: 'error', message: 'ধরন ভুল' });
+    }
+    const transaction = await createPartnerTransaction({
+      userId: req.user.id,
+      type,
+      description,
+      amount,
+      addedByUserId: req.user.id,
+      imageUrl: image_url
+    });
+    res.json({ status: 'ok', transaction });
+  } catch (err) {
+    res.status(500).json({ status: 'error', message: err.message });
+  }
+});
+
+// এন্ট্রি এডিট করুন — শুধু যে যোগ করেছে সেই এডিট করতে পারবে, ডিলিট কখনো করা যাবে না
+// এন্ট্রি এডিট করার অনুরোধ পাঠান — সাথে সাথে বদলায় না, অন্য পার্টনারের অনুমোদন লাগবে
+app.put('/api/partners/transactions/:id', verifyAuth, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { description, amount, image_url } = req.body;
+    const existing = await pool.query(`SELECT * FROM partner_transactions WHERE id = $1`, [id]);
+    if (existing.rows.length === 0) {
+      return res.status(404).json({ status: 'error', message: 'এন্ট্রি পাওয়া যায়নি' });
+    }
+    const old = existing.rows[0];
+    if (old.added_by_user_id !== req.user.id) {
+      return res.status(403).json({ status: 'error', message: 'শুধু যিনি এই এন্ট্রি যোগ করেছেন তিনিই এডিট করতে পারবেন' });
+    }
+
+    const newDescription = description || old.description;
+    const newAmount = amount || old.amount;
+    const newImageUrl = image_url !== undefined ? image_url : old.image_url;
+
+    const editReqResult = await pool.query(
+      `INSERT INTO partner_edit_requests
+        (transaction_id, requested_by_user_id, old_description, old_amount, old_image_url, new_description, new_amount, new_image_url)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+       RETURNING *`,
+      [id, req.user.id, old.description, old.amount, old.image_url, newDescription, newAmount, newImageUrl]
+    );
+    const editRequestId = editReqResult.rows[0].id;
+
+    // অন্য পার্টনারদের কাছে অনুমোদনের জন্য বিশেষ নোটিফিকেশন পাঠানো
+    const otherPartners = await pool.query(
+      `SELECT id FROM users WHERE is_partner = true AND active = true AND id != $1`,
+      [req.user.id]
+    );
+    for (const p of otherPartners.rows) {
+      await pool.query(
+        `INSERT INTO partner_notifications (user_id, message, type, edit_request_id) VALUES ($1, $2, 'edit_approval', $3)`,
+        [p.id, `${req.user.name} একটা পোস্ট এডিট করতে চাচ্ছেন — অনুমোদন প্রয়োজন`, editRequestId]
+      );
+    }
+
+    res.json({ status: 'ok', pending: true, message: 'এডিট অনুরোধ পাঠানো হয়েছে, অন্য পার্টনারের অনুমোদনের অপেক্ষায় আছে' });
+  } catch (err) {
+    res.status(500).json({ status: 'error', message: err.message });
+  }
+});
+
+// এডিট অনুরোধ অনুমোদন করুন — যিনি এডিট করেছেন তিনি নিজেরটা অনুমোদন করতে পারবেন না
+app.post('/api/partners/edit-requests/:id/approve', verifyAuth, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const erResult = await pool.query(`SELECT * FROM partner_edit_requests WHERE id = $1`, [id]);
+    if (erResult.rows.length === 0) {
+      return res.status(404).json({ status: 'error', message: 'অনুরোধ পাওয়া যায়নি' });
+    }
+    const request = erResult.rows[0];
+    if (request.status !== 'pending') {
+      return res.json({ status: 'ok', already_resolved: true });
+    }
+    if (request.requested_by_user_id === req.user.id) {
+      return res.status(403).json({ status: 'error', message: 'নিজের এডিট নিজে অনুমোদন করা যাবে না' });
+    }
+
+    await pool.query(
+      `UPDATE partner_transactions SET description = $1, amount = $2, image_url = $3 WHERE id = $4`,
+      [request.new_description, request.new_amount, request.new_image_url, request.transaction_id]
+    );
+    await pool.query(
+      `UPDATE partner_edit_requests SET status = 'approved', resolved_by_user_id = $1, resolved_at = NOW() WHERE id = $2`,
+      [req.user.id, id]
+    );
+    await pool.query(`UPDATE partner_notifications SET is_read = true, read_at = NOW() WHERE edit_request_id = $1`, [id]);
+    await pool.query(
+      `INSERT INTO partner_notifications (user_id, message, type, edit_request_id) VALUES ($1, $2, 'edit_approval', $3)`,
+      [request.requested_by_user_id, 'আপনার এডিট এপ্রুভ করা হয়েছে ✅', id]
+    );
+
+    res.json({ status: 'ok' });
+  } catch (err) {
+    res.status(500).json({ status: 'error', message: err.message });
+  }
+});
+
+// এডিট অনুরোধ রিজেক্ট করুন — পোস্ট অপরিবর্তিত থাকবে
+app.post('/api/partners/edit-requests/:id/reject', verifyAuth, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const erResult = await pool.query(`SELECT * FROM partner_edit_requests WHERE id = $1`, [id]);
+    if (erResult.rows.length === 0) {
+      return res.status(404).json({ status: 'error', message: 'অনুরোধ পাওয়া যায়নি' });
+    }
+    const request = erResult.rows[0];
+    if (request.status !== 'pending') {
+      return res.json({ status: 'ok', already_resolved: true });
+    }
+    if (request.requested_by_user_id === req.user.id) {
+      return res.status(403).json({ status: 'error', message: 'নিজের এডিট নিজে রিজেক্ট করা যাবে না' });
+    }
+
+    await pool.query(
+      `UPDATE partner_edit_requests SET status = 'rejected', resolved_by_user_id = $1, resolved_at = NOW() WHERE id = $2`,
+      [req.user.id, id]
+    );
+    await pool.query(`UPDATE partner_notifications SET is_read = true, read_at = NOW() WHERE edit_request_id = $1`, [id]);
+    await pool.query(
+      `INSERT INTO partner_notifications (user_id, message, type, edit_request_id) VALUES ($1, $2, 'edit_approval', $3)`,
+      [request.requested_by_user_id, 'আপনার এডিট রিজেক্ট করা হয়েছে ❌', id]
+    );
+
+    res.json({ status: 'ok' });
+  } catch (err) {
+    res.status(500).json({ status: 'error', message: err.message });
+  }
+});
+
+// সব পার্টনার/এডমিনের খরচ একসাথে (মূল "খরচের বিস্তারিত" রিপোর্টে দেখানোর জন্য)
+app.get('/api/partners/expenses-all', async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT pt.id, pt.description, pt.amount, pt.event_time, u.name AS added_by_name
+       FROM partner_transactions pt
+       JOIN users u ON u.id = pt.added_by_user_id
+       WHERE pt.type = 'expense'
+       ORDER BY pt.event_time DESC
+       LIMIT 200`
+    );
+    res.json({ status: 'ok', expenses: result.rows });
+  } catch (err) {
+    res.status(500).json({ status: 'error', message: err.message });
+  }
+});
+
+// সব পার্টনারের সব এন্ট্রি (খরচ + ক্যাশ) একসাথে — পোস্ট লগ/ফিড পেজের জন্য (এডমিন/মডারেটরও দেখতে পারবে)
+app.get('/api/partners/all-transactions', verifyAuthOptional, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT pt.*, u.name AS added_by_name, u.photo_url AS added_by_photo
+       FROM partner_transactions pt
+       JOIN users u ON u.id = pt.added_by_user_id
+       ORDER BY pt.event_time ASC, pt.created_at ASC
+       LIMIT 500`
+    );
+    const withReactions = await attachReactions(result.rows, req.user ? req.user.id : null);
+    res.json({ status: 'ok', transactions: withReactions });
+  } catch (err) {
+    res.status(500).json({ status: 'error', message: err.message });
+  }
+});
+
+// পোস্টে লাইক/লাভ রিয়েক্ট দিন (আগে দেওয়া থাকলে বদলে যাবে) — যেকোনো লগইন করা ইউজার দিতে পারবে
+app.post('/api/partners/transactions/:id/react', verifyAuth, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { reaction_type } = req.body;
+    if (!['like', 'love'].includes(reaction_type)) {
+      return res.status(400).json({ status: 'error', message: 'রিয়েক্ট ধরন ভুল' });
+    }
+    await pool.query(
+      `INSERT INTO partner_transaction_reactions (transaction_id, user_id, reaction_type)
+       VALUES ($1, $2, $3)
+       ON CONFLICT (transaction_id, user_id) DO UPDATE SET reaction_type = EXCLUDED.reaction_type`,
+      [id, req.user.id, reaction_type]
+    );
+    res.json({ status: 'ok' });
+  } catch (err) {
+    res.status(500).json({ status: 'error', message: err.message });
+  }
+});
+
+// নিজের রিয়েক্ট সরিয়ে ফেলুন
+app.delete('/api/partners/transactions/:id/react', verifyAuth, async (req, res) => {
+  try {
+    const { id } = req.params;
+    await pool.query(
+      `DELETE FROM partner_transaction_reactions WHERE transaction_id = $1 AND user_id = $2`,
+      [id, req.user.id]
+    );
+    res.json({ status: 'ok' });
+  } catch (err) {
+    res.status(500).json({ status: 'error', message: err.message });
+  }
+});
+
+// ==================== নোটিফিকেশন ====================
+
+// নোটিফিকেশনের সাথে এডিট-রিকোয়েস্টের বিস্তারিত জুড়ে দেয় (edit_approval টাইপের জন্য)
+async function enrichNotifications(rows) {
+  const notifications = [];
+  for (const n of rows) {
+    if (n.type === 'edit_approval' && n.edit_request_id) {
+      const erResult = await pool.query(
+        `SELECT er.*, u.name AS requested_by_name, pt.description AS current_description, pt.amount AS current_amount, pt.image_url AS current_image_url, pt.type AS txn_type
+         FROM partner_edit_requests er
+         JOIN users u ON u.id = er.requested_by_user_id
+         JOIN partner_transactions pt ON pt.id = er.transaction_id
+         WHERE er.id = $1`,
+        [n.edit_request_id]
+      );
+      notifications.push({ ...n, edit_request: erResult.rows[0] || null });
+    } else {
+      notifications.push(n);
+    }
+  }
+  return notifications;
+}
+
+app.get('/api/notifications', verifyAuth, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT * FROM partner_notifications WHERE user_id = $1 AND is_read = false ORDER BY created_at DESC LIMIT 50`,
+      [req.user.id]
+    );
+    const notifications = await enrichNotifications(result.rows);
+    res.json({ status: 'ok', notifications });
+  } catch (err) {
+    res.status(500).json({ status: 'error', message: err.message });
+  }
+});
+
+// নোটিফিকেশন হিস্ট্রি — রিড করা নোটিফিকেশন এখানে ২৪ ঘণ্টা থাকে, তারপর পার্মানেন্ট ডিলিট হয়ে যায়
+app.get('/api/notifications/history', verifyAuth, async (req, res) => {
+  try {
+    // ২৪ ঘণ্টার বেশি পুরনো রিড নোটিফিকেশন পার্মানেন্টলি মুছে ফেলা (lazy cleanup)
+    await pool.query(
+      `DELETE FROM partner_notifications WHERE is_read = true AND read_at IS NOT NULL AND read_at < NOW() - INTERVAL '30 days'`
+    );
+    const result = await pool.query(
+      `SELECT * FROM partner_notifications WHERE user_id = $1 AND is_read = true AND read_at >= NOW() - INTERVAL '30 days'
+       ORDER BY read_at DESC LIMIT 100`,
+      [req.user.id]
+    );
+    const notifications = await enrichNotifications(result.rows);
+    res.json({ status: 'ok', notifications });
+  } catch (err) {
+    res.status(500).json({ status: 'error', message: err.message });
+  }
+});
+
+app.get('/api/notifications/unread-count', verifyAuth, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT COUNT(*) FROM partner_notifications WHERE user_id = $1 AND is_read = false`,
+      [req.user.id]
+    );
+    res.json({ status: 'ok', count: parseInt(result.rows[0].count) });
+  } catch (err) {
+    res.status(500).json({ status: 'error', message: err.message });
+  }
+});
+
+// একটা নির্দিষ্ট নোটিফিকেশন রিড করুন (হিস্ট্রিতে চলে যাবে, ২৪ ঘণ্টা পর পার্মানেন্ট ডিলিট হবে)
+app.post('/api/notifications/:id/read', verifyAuth, async (req, res) => {
+  try {
+    await pool.query(
+      `UPDATE partner_notifications SET is_read = true, read_at = NOW() WHERE id = $1 AND user_id = $2`,
+      [req.params.id, req.user.id]
+    );
+    res.json({ status: 'ok' });
+  } catch (err) {
+    res.status(500).json({ status: 'error', message: err.message });
+  }
+});
+
+app.post('/api/notifications/mark-read', verifyAuth, async (req, res) => {
+  try {
+    await pool.query(`UPDATE partner_notifications SET is_read = true, read_at = NOW() WHERE user_id = $1`, [req.user.id]);
+    res.json({ status: 'ok' });
+  } catch (err) {
+    res.status(500).json({ status: 'error', message: err.message });
+  }
+});
+
+// নতুন স্টাফ/কারিগর যোগ করুন
+app.post('/api/staff', async (req, res) => {
+  try {
+    const { name, phone, designation, rate_type, rate_amount, joining_date, machine_user_id } = req.body;
+    if (!name) {
+      return res.status(400).json({ status: 'error', message: 'নাম দেওয়া বাধ্যতামূলক' });
+    }
+    const result = await pool.query(
+      `INSERT INTO staff (name, phone, designation, rate_type, rate_amount, joining_date, machine_user_id)
+       VALUES ($1, $2, $3, $4, $5, COALESCE($6, CURRENT_DATE), $7)
+       RETURNING *`,
+      [name, phone || null, designation || null, rate_type || 'piece', rate_amount || 0, joining_date || null, machine_user_id || null]
+    );
+    res.json({ status: 'ok', staff: result.rows[0] });
+  } catch (err) {
+    res.status(500).json({ status: 'error', message: err.message });
+  }
+});
+
+// সব স্টাফ/কারিগরের লিস্ট দেখুন
+app.get('/api/staff', async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT * FROM staff WHERE active = true ORDER BY created_at DESC`
+    );
+    res.json({ status: 'ok', staff: result.rows });
+  } catch (err) {
+    res.status(500).json({ status: 'error', message: err.message });
+  }
+});
+
+// একজন স্টাফ/কারিগরের তথ্য আপডেট করুন
+app.put('/api/staff/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { name, phone, designation, rate_type, rate_amount, machine_user_id } = req.body;
+    const result = await pool.query(
+      `UPDATE staff SET
+        name = COALESCE($1, name),
+        phone = COALESCE($2, phone),
+        designation = COALESCE($3, designation),
+        rate_type = COALESCE($4, rate_type),
+        rate_amount = COALESCE($5, rate_amount),
+        machine_user_id = COALESCE($6, machine_user_id)
+       WHERE id = $7
+       RETURNING *`,
+      [name, phone, designation, rate_type, rate_amount, machine_user_id, id]
+    );
+    if (result.rows.length === 0) {
+      return res.status(404).json({ status: 'error', message: 'স্টাফ পাওয়া যায়নি' });
+    }
+    res.json({ status: 'ok', staff: result.rows[0] });
+  } catch (err) {
+    res.status(500).json({ status: 'error', message: err.message });
+  }
+});
+
+// একজন স্টাফ/কারিগরকে মুছে ফেলুন (আসলে active=false করা হয়, ডেটা থেকেই যায়)
+app.delete('/api/staff/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    await pool.query(`UPDATE staff SET active = false WHERE id = $1`, [id]);
+    res.json({ status: 'ok' });
+  } catch (err) {
+    res.status(500).json({ status: 'error', message: err.message });
+  }
+});
+
+// ==================== আগের হিসাব (স্টাফের পুরনো পাওনা/দেনা সমন্বয়) ====================
+
+// সব স্টাফের মোট আগের-হিসাব সমন্বয় — লিস্টে ব্যাজ দেখানো ও পাওনা হিসাবে যোগ করার জন্য
+app.get('/api/staff/balance-adjustments/summary', async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT staff_id, COALESCE(SUM(amount), 0) AS total FROM staff_balance_adjustments GROUP BY staff_id`
+    );
+    const map = {};
+    result.rows.forEach((r) => { map[r.staff_id] = parseFloat(r.total); });
+    res.json({ status: 'ok', adjustments: map });
+  } catch (err) {
+    res.status(500).json({ status: 'error', message: err.message });
+  }
+});
+
+// একজন স্টাফের আগের-হিসাব এন্ট্রির লিস্ট
+app.get('/api/staff/:id/balance-adjustments', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const result = await pool.query(
+      `SELECT * FROM staff_balance_adjustments WHERE staff_id = $1 ORDER BY created_at DESC`,
+      [id]
+    );
+    res.json({ status: 'ok', adjustments: result.rows });
+  } catch (err) {
+    res.status(500).json({ status: 'error', message: err.message });
+  }
+});
+
+// নতুন আগের-হিসাব এন্ট্রি যোগ করুন — amount সবসময় পজিটিভ পাঠানো হবে, direction দিয়ে বোঝানো হবে + না -
+app.post('/api/staff/:id/balance-adjustments', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { amount, direction, note } = req.body; // direction: 'staff_owed' | 'factory_owed'
+    if (!amount || parseFloat(amount) <= 0 || !direction) {
+      return res.status(400).json({ status: 'error', message: 'টাকার পরিমাণ এবং কে পাবে সেটা দিতে হবে' });
+    }
+    const signedAmount = direction === 'staff_owed' ? Math.abs(parseFloat(amount)) : -Math.abs(parseFloat(amount));
+    const result = await pool.query(
+      `INSERT INTO staff_balance_adjustments (staff_id, amount, note) VALUES ($1, $2, $3) RETURNING *`,
+      [id, signedAmount, note || 'আগের হিসাবের আপডেট']
+    );
+    res.json({ status: 'ok', adjustment: result.rows[0] });
+  } catch (err) {
+    res.status(500).json({ status: 'error', message: err.message });
+  }
+});
+
+// ==================== উপস্থিতি (Attendance) ====================
+
+// আজকে একজন স্টাফের ঘটনাগুলো বের করে সাহায্যকারী ফাংশন
+async function getTodayEvents(staffId) {
+  const result = await pool.query(
+    `SELECT * FROM attendance_events
+     WHERE staff_id = $1 AND (event_time + interval '6 hours')::date = (now() + interval '6 hours')::date
+     ORDER BY event_time ASC`,
+    [staffId]
+  );
+  return result.rows;
+}
+
+// পরবর্তী ইভেন্ট কী হবে সেটা ঠিক করে (present বাটনের টগল লজিক)
+function nextPresentEventType(todayEvents) {
+  if (todayEvents.length === 0) return 'check_in';
+  const last = todayEvents[todayEvents.length - 1].event_type;
+  if (last === 'check_in') return 'check_out';
+  if (last === 'break_start') return 'break_end';
+  if (last === 'break_end') return 'check_out';
+  if (last === 'check_out') return 'check_in'; // নতুন সেশন (বিরল)
+  return 'check_in';
+}
+
+// মাসিক বেতনের কারিগরের সঠিক মজুরি হিসাব — শুক্রবার সাপ্তাহিক বন্ধ (পূর্ণ বেতনসহ),
+// উপস্থিত দিনের বেতন যোগ, লেট মিনিটের বেতন কাটা, অনুপস্থিত দিনের বেতন কাটা
+// একজন স্টাফের দৈনিক রেট, মিনিট-রেট, ঘণ্টা-রেট বের করে (ডিউটি শিডিউল + মাসিক বেতন থেকে) — সবখানে একই হিসাব ব্যবহারের জন্য
+function computeRates(staff, duty) {
+  const toMinutes = (t) => {
+    const [h, m] = t.split(':').map(Number);
+    return h * 60 + m;
+  };
+  let workMinutes = 480;
+  if (duty) {
+    const s1 = toMinutes(duty.shift1_end) - toMinutes(duty.shift1_start);
+    const s2 = toMinutes(duty.shift2_end) - toMinutes(duty.shift2_start);
+    workMinutes = Math.max(1, s1) + Math.max(1, s2);
+  }
+  const dailyRate = parseFloat(staff.rate_amount || 0) / 30;
+  const perMinuteRate = dailyRate / workMinutes;
+  return { dailyRate, perMinuteRate, hourlyRate: perMinuteRate * 60, halfDailyRate: dailyRate / 2 };
+}
+
+async function computeSalaryBreakdown(staffId, days) {
+  const staffResult = await pool.query(`SELECT * FROM staff WHERE id = $1`, [staffId]);
+  if (staffResult.rows.length === 0) return null;
+  const staff = staffResult.rows[0];
+
+  const dutyResult = await pool.query(`SELECT * FROM duty_schedule WHERE id = 1`);
+  const duty = dutyResult.rows[0] || null;
+
+  const { dailyRate, halfDailyRate } = computeRates(staff, duty);
+
+  const eventsResult = await pool.query(
+    `SELECT * FROM attendance_events
+     WHERE staff_id = $1 AND event_time >= (now() + interval '6 hours')::date - ($2 || ' days')::interval - interval '6 hours'
+     ORDER BY event_time ASC`,
+    [staffId, days]
+  );
+  const byDate = {};
+  for (const ev of eventsResult.rows) {
+    const d = bdDateStr(ev.event_time);
+    if (!byDate[d]) byDate[d] = [];
+    byDate[d].push(ev);
+  }
+
+  const joining = new Date(staff.joining_date);
+  const rangeStart = new Date();
+  rangeStart.setDate(rangeStart.getDate() - (days - 1));
+  const startDate = joining > rangeStart ? joining : rangeStart;
+
+  const breakdown = [];
+  let totalEarned = 0;
+
+  for (let d = new Date(startDate); d <= new Date(); d.setDate(d.getDate() + 1)) {
+    const dateStr = bdDateStr(d);
+    const dayOfWeek = d.getDay(); // ৫ = শুক্রবার
+
+    if (dayOfWeek === 5) {
+      breakdown.push({ date: dateStr, status: 'holiday', late_minutes: 0, day_earned: +dailyRate.toFixed(2) });
+      totalEarned += dailyRate;
+      continue;
+    }
+
+    const events = byDate[dateStr] || [];
+    const shift1Start = timeOnDate(dateStr, duty ? duty.shift1_start : '09:00');
+    const shift1End = timeOnDate(dateStr, duty ? duty.shift1_end : '14:00');
+    const shift1WindowEnd = new Date(shift1Start.getTime() + SHIFT_WINDOW_AFTER_MIN * 60000);
+    const shift2Start = timeOnDate(dateStr, duty ? duty.shift2_start : '15:00');
+    const shift2End = timeOnDate(dateStr, duty ? duty.shift2_end : '22:00');
+    const shift2WindowEnd = new Date(shift2Start.getTime() + SHIFT_WINDOW_AFTER_MIN * 60000);
+
+    const s1CheckIn = events.find((e) => e.shift === 1 && e.event_type === 'check_in');
+    const s1CheckOut = events.find((e) => e.shift === 1 && e.event_type === 'check_out');
+    const s2CheckIn = events.find((e) => e.shift === 2 && e.event_type === 'check_in');
+    const s2CheckOut = events.find((e) => e.shift === 2 && e.event_type === 'check_out');
+
+    const shift1Outcome = computeShiftOutcome(
+      s1CheckIn ? new Date(s1CheckIn.event_time) : null,
+      s1CheckOut ? new Date(s1CheckOut.event_time) : null,
+      shift1Start, shift1End, shift1WindowEnd, halfDailyRate
+    );
+    const shift2Outcome = computeShiftOutcome(
+      s2CheckIn ? new Date(s2CheckIn.event_time) : null,
+      s2CheckOut ? new Date(s2CheckOut.event_time) : null,
+      shift2Start, shift2End, shift2WindowEnd, halfDailyRate
+    );
+
+    if (!shift1Outcome.attended && !shift2Outcome.attended) {
+      breakdown.push({ date: dateStr, status: 'absent', late_minutes: 0, day_earned: 0, shift1: shift1Outcome, shift2: shift2Outcome });
+      continue;
+    }
+
+    const dayEarned = shift1Outcome.pay + shift2Outcome.pay;
+    const totalLateMinutes = shift1Outcome.late_minutes + shift2Outcome.late_minutes;
+    totalEarned += dayEarned;
+    breakdown.push({
+      date: dateStr,
+      status: 'present',
+      late_minutes: totalLateMinutes,
+      day_earned: +dayEarned.toFixed(2),
+      shift1: shift1Outcome,
+      shift2: shift2Outcome
+    });
+  }
+
+  breakdown.reverse(); // সাম্প্রতিক তারিখ আগে
+
+  const paymentsResult = await pool.query(
+    `SELECT COALESCE(SUM(amount),0) AS total_paid FROM staff_payments WHERE staff_id = $1`,
+    [staffId]
+  );
+  const totalPaid = parseFloat(paymentsResult.rows[0].total_paid);
+
+  // শেষ হওয়া ওভারটাইম সেশনগুলো — টাকা বেতনে যোগ হবে, ক্যাশ মেমোতেও আলাদা করে দেখানো হবে
+  const overtimeResult = await pool.query(
+    `SELECT * FROM overtime_sessions WHERE staff_id = $1 AND end_time IS NOT NULL ORDER BY end_time DESC`,
+    [staffId]
+  );
+  const overtime = overtimeResult.rows.map((o) => ({
+    date: bdDateStr(o.end_time),
+    start_time: o.start_time,
+    end_time: o.end_time,
+    hours: parseFloat(o.hours),
+    amount: parseFloat(o.amount)
+  }));
+  const totalOvertimeAmount = overtime.reduce((sum, o) => sum + o.amount, 0);
+  totalEarned += totalOvertimeAmount;
+
+  // আগের হিসাবের সমন্বয় — পাওনার সাথে যোগ/বাদ (পার্টনার হিসাবের সাথে সম্পর্কহীন)
+  const adjustmentResult = await pool.query(
+    `SELECT COALESCE(SUM(amount), 0) AS total FROM staff_balance_adjustments WHERE staff_id = $1`,
+    [staffId]
+  );
+  const previousBalanceAdjustment = parseFloat(adjustmentResult.rows[0].total);
+
+  return {
+    staff_id: staff.id,
+    name: staff.name,
+    daily_rate: +dailyRate.toFixed(2),
+    total_salary_earned: +totalEarned.toFixed(2),
+    total_paid: totalPaid,
+    previous_balance_adjustment: +previousBalanceAdjustment.toFixed(2),
+    total_due: +(totalEarned - totalPaid + previousBalanceAdjustment).toFixed(2),
+    breakdown,
+    overtime,
+    total_overtime_amount: +totalOvertimeAmount.toFixed(2)
+  };
+}
+
+// আজকের সব স্টাফের বর্তমান স্ট্যাটাস (উপস্থিত / বিরতিতে / চলে গেছে / মার্ক করা হয়নি)
+// আজকের সব উপস্থিতির রেকর্ড মুছে ফেলুন — এরপর থেকে নতুন ফিঙ্গার/এন্ট্রি দিয়ে আবার শুরু হবে
+app.delete('/api/attendance/clear-today', async (req, res) => {
+  try {
+    const result = await pool.query(`DELETE FROM attendance_events WHERE (event_time + interval '6 hours')::date = (now() + interval '6 hours')::date`);
+    res.json({ status: 'ok', deleted: result.rowCount });
+  } catch (err) {
+    res.status(500).json({ status: 'error', message: err.message });
+  }
+});
+
+// সব স্টাফ পেমেন্ট মুছে ফেলুন (টেস্ট/ডেমো ডেটা পরিষ্কার করার জন্য)
+app.delete('/api/staff-payments/clear-all', async (req, res) => {
+  try {
+    const result = await pool.query(`DELETE FROM staff_payments`);
+    res.json({ status: 'ok', deleted: result.rowCount });
+  } catch (err) {
+    res.status(500).json({ status: 'error', message: err.message });
+  }
+});
+
+app.get('/api/attendance/today', async (req, res) => {
+  try {
+    const staffResult = await pool.query(`SELECT * FROM staff WHERE active = true ORDER BY name ASC`);
+    const eventsResult = await pool.query(
+      `SELECT * FROM attendance_events WHERE (event_time + interval '6 hours')::date = (now() + interval '6 hours')::date ORDER BY event_time ASC`
+    );
+    const dutyResult = await pool.query(`SELECT * FROM duty_schedule WHERE id = 1`);
+    const duty = dutyResult.rows[0] || null;
+
+    const today = bdDateStr(new Date());
+    const now = new Date();
+    const shift1Start = timeOnDate(today, duty ? duty.shift1_start : '09:00');
+    const shift1End = timeOnDate(today, duty ? duty.shift1_end : '14:00');
+    const shift1WindowEnd = new Date(shift1Start.getTime() + SHIFT_WINDOW_AFTER_MIN * 60000);
+    const shift2Start = timeOnDate(today, duty ? duty.shift2_start : '15:00');
+    const shift2End = timeOnDate(today, duty ? duty.shift2_end : '22:00');
+    const shift2WindowEnd = new Date(shift2Start.getTime() + SHIFT_WINDOW_AFTER_MIN * 60000);
+
+    const eventsByStaff = {};
+    for (const ev of eventsResult.rows) {
+      if (!eventsByStaff[ev.staff_id]) eventsByStaff[ev.staff_id] = [];
+      eventsByStaff[ev.staff_id].push(ev);
+    }
+
+    const list = staffResult.rows.map((s) => {
+      const events = eventsByStaff[s.id] || [];
+      const s1CheckIn = events.find((e) => e.shift === 1 && e.event_type === 'check_in');
+      const s1CheckOut = events.find((e) => e.shift === 1 && e.event_type === 'check_out');
+      const s2CheckIn = events.find((e) => e.shift === 2 && e.event_type === 'check_in');
+      const s2CheckOut = events.find((e) => e.shift === 2 && e.event_type === 'check_out');
+
+      const shift1LateMin = s1CheckIn
+        ? Math.max(0, Math.round((new Date(s1CheckIn.event_time) - shift1WindowEnd) / 60000))
+        : 0;
+      const shift2LateMin = s2CheckIn
+        ? Math.max(0, Math.round((new Date(s2CheckIn.event_time) - shift2WindowEnd) / 60000))
+        : 0;
+
+      let status = 'not_marked';
+      let note = null;
+      let currentShift = null;
+
+      if (s2CheckOut) {
+        status = 'checked_out';
+        currentShift = 2;
+      } else if (s2CheckIn) {
+        status = 'present';
+        currentShift = 2;
+      } else if (now >= shift1End) {
+        // শিফট-১ শেষ, শিফট-২ এখনো শুরু হয়নি এই স্টাফের জন্য
+        status = 'absent';
+        note = 'লাঞ্চ টাইম চলছে';
+        currentShift = null;
+      } else if (s1CheckOut) {
+        status = 'checked_out';
+        currentShift = 1;
+      } else if (s1CheckIn) {
+        status = 'present';
+        currentShift = 1;
+      }
+
+      return {
+        staff_id: s.id,
+        name: s.name,
+        designation: s.designation,
+        phone: s.phone,
+        status,
+        note,
+        current_shift: currentShift,
+        check_in: currentShift === 2 ? (s2CheckIn ? s2CheckIn.event_time : null) : (s1CheckIn ? s1CheckIn.event_time : null),
+        check_out: s2CheckOut ? s2CheckOut.event_time : (s1CheckOut ? s1CheckOut.event_time : null),
+        late_minutes: shift1LateMin + shift2LateMin,
+        shift1: {
+          check_in: s1CheckIn ? s1CheckIn.event_time : null,
+          check_out: s1CheckOut ? s1CheckOut.event_time : null,
+          late_minutes: shift1LateMin
+        },
+        shift2: {
+          check_in: s2CheckIn ? s2CheckIn.event_time : null,
+          check_out: s2CheckOut ? s2CheckOut.event_time : null,
+          late_minutes: shift2LateMin
+        },
+        events
+      };
+    });
+
+    res.json({ status: 'ok', staff: list });
+  } catch (err) {
+    res.status(500).json({ status: 'error', message: err.message });
+  }
+});
+
+// একজন স্টাফের গত ৩০ দিনের সামারি (উপস্থিত ঘণ্টা, ব্রেক ঘণ্টা, লেট, অনুপস্থিত দিন)
+app.get('/api/attendance/summary/:staffId', async (req, res) => {
+  try {
+    const { staffId } = req.params;
+    const days = parseInt(req.query.days) || 30;
+
+    const staffResult = await pool.query(`SELECT * FROM staff WHERE id = $1`, [staffId]);
+    if (staffResult.rows.length === 0) {
+      return res.status(404).json({ status: 'error', message: 'স্টাফ পাওয়া যায়নি' });
+    }
+    const staff = staffResult.rows[0];
+
+    const dutyResult = await pool.query(`SELECT * FROM duty_schedule WHERE id = 1`);
+    const duty = dutyResult.rows[0] || null;
+
+    const eventsResult = await pool.query(
+      `SELECT * FROM attendance_events
+       WHERE staff_id = $1 AND event_time >= (now() + interval '6 hours')::date - ($2 || ' days')::interval - interval '6 hours'
+       ORDER BY event_time ASC`,
+      [staffId, days]
+    );
+
+    // তারিখ অনুযায়ী গ্রুপ করা
+    const byDate = {};
+    for (const ev of eventsResult.rows) {
+      const d = bdDateStr(ev.event_time);
+      if (!byDate[d]) byDate[d] = [];
+      byDate[d].push(ev);
+    }
+
+    let totalPresentMs = 0;
+    let totalBreakMs = 0;
+    let totalLateMs = 0;
+    let presentDays = 0;
+    let shift1PresentDays = 0;
+    let shift2PresentDays = 0;
+    let shift1PresentMs = 0;
+    let shift2PresentMs = 0;
+
+    for (const date of Object.keys(byDate)) {
+      const events = byDate[date];
+      const s1CheckIn = events.find((e) => e.shift === 1 && e.event_type === 'check_in');
+      const s1CheckOut = events.find((e) => e.shift === 1 && e.event_type === 'check_out');
+      const s2CheckIn = events.find((e) => e.shift === 2 && e.event_type === 'check_in');
+      const s2CheckOut = events.find((e) => e.shift === 2 && e.event_type === 'check_out');
+
+      if (s1CheckIn || s2CheckIn) presentDays++;
+      if (s1CheckIn) shift1PresentDays++;
+      if (s2CheckIn) shift2PresentDays++;
+
+      const shift1Start = timeOnDate(date, duty ? duty.shift1_start : '09:00');
+      const shift1End = timeOnDate(date, duty ? duty.shift1_end : '14:00');
+      const shift1WindowEnd = new Date(shift1Start.getTime() + SHIFT_WINDOW_AFTER_MIN * 60000);
+      const shift2Start = timeOnDate(date, duty ? duty.shift2_start : '15:00');
+      const shift2End = timeOnDate(date, duty ? duty.shift2_end : '22:00');
+      const shift2WindowEnd = new Date(shift2Start.getTime() + SHIFT_WINDOW_AFTER_MIN * 60000);
+
+      // চেক-আউট না থাকলে (যেমন ম্যানুয়ালি যোগ করা এন্ট্রি) পুরো শিফট সময়টাই ধরা হবে —
+      // বেতন হিসাবের মতোই একই যুক্তি
+      if (s1CheckIn) {
+        const inTime = new Date(s1CheckIn.event_time);
+        const outTime = s1CheckOut ? new Date(s1CheckOut.event_time) : shift1End;
+        shift1PresentMs += Math.max(0, outTime - inTime);
+      }
+      if (s2CheckIn) {
+        const inTime = new Date(s2CheckIn.event_time);
+        const outTime = s2CheckOut ? new Date(s2CheckOut.event_time) : shift2End;
+        shift2PresentMs += Math.max(0, outTime - inTime);
+      }
+
+      // দুই শিফটই হাজির থাকলে মাঝের সময়টা লাঞ্চ/বিরতি হিসেবে গণনা
+      if (s1CheckIn && s2CheckIn && duty) {
+        totalBreakMs += Math.max(0, shift2Start - shift1End);
+      }
+
+      if (s1CheckIn) {
+        totalLateMs += Math.max(0, new Date(s1CheckIn.event_time) - shift1WindowEnd);
+      }
+      if (s2CheckIn) {
+        totalLateMs += Math.max(0, new Date(s2CheckIn.event_time) - shift2WindowEnd);
+      }
+    }
+
+    totalPresentMs = shift1PresentMs + shift2PresentMs;
+
+    // যোগদানের তারিখ থেকে হিসাব করে মোট কর্মদিবস বের করা (সর্বোচ্চ `days` দিন) — তারিখ-স্ট্রিং মিলিয়ে গণনা,
+    // সময়-সহ Date বিয়োগ করলে ঘণ্টার হেরফেরে ভুল দিন-সংখ্যা আসতে পারে বলে এভাবে করা হচ্ছে
+    const joiningDateStr = staff.joining_date
+      ? (staff.joining_date.toISOString ? staff.joining_date.toISOString().slice(0, 10) : String(staff.joining_date).slice(0, 10))
+      : bdDateStr(new Date());
+    const todayDateStr = bdDateStr(new Date());
+    const daysSinceJoiningRaw = Math.round((new Date(todayDateStr) - new Date(joiningDateStr)) / (1000 * 60 * 60 * 24)) + 1;
+    const daysSinceJoining = Math.min(days, Math.max(1, daysSinceJoiningRaw));
+    const absentDays = Math.max(0, daysSinceJoining - presentDays);
+
+    // একই সময়সীমার মধ্যে হওয়া মোট ওভারটাইম ঘণ্টা
+    const overtimeResult = await pool.query(
+      `SELECT COALESCE(SUM(hours),0) AS total_overtime_hours
+       FROM overtime_sessions
+       WHERE staff_id = $1 AND end_time IS NOT NULL
+       AND end_time >= (now() + interval '6 hours')::date - ($2 || ' days')::interval - interval '6 hours'`,
+      [staffId, days]
+    );
+    const totalOvertimeHours = parseFloat(overtimeResult.rows[0].total_overtime_hours);
+
+    res.json({
+      status: 'ok',
+      summary: {
+        staff_id: staff.id,
+        name: staff.name,
+        present_days: presentDays,
+        absent_days: absentDays,
+        present_hours: +(totalPresentMs / 3600000).toFixed(1),
+        break_hours: +(totalBreakMs / 3600000).toFixed(1),
+        late_hours: +(totalLateMs / 3600000).toFixed(1),
+        overtime_hours: +totalOvertimeHours.toFixed(1),
+        shift1_present_days: shift1PresentDays,
+        shift2_present_days: shift2PresentDays,
+        shift1_hours: +(shift1PresentMs / 3600000).toFixed(1),
+        shift2_hours: +(shift2PresentMs / 3600000).toFixed(1)
+      }
+    });
+  } catch (err) {
+    res.status(500).json({ status: 'error', message: err.message });
+  }
+});
+
+// একজন স্টাফের দিন-ভিত্তিক উপস্থিতির বিস্তারিত লিস্ট (ক'টায় ঢুকল, ক'টায় বের হলো, লেট কত মিনিট, কোন দিন অনুপস্থিত)
+app.get('/api/attendance/daily/:staffId', async (req, res) => {
+  try {
+    const { staffId } = req.params;
+    const days = parseInt(req.query.days) || 30;
+
+    const staffResult = await pool.query(`SELECT * FROM staff WHERE id = $1`, [staffId]);
+    if (staffResult.rows.length === 0) {
+      return res.status(404).json({ status: 'error', message: 'স্টাফ পাওয়া যায়নি' });
+    }
+    const staff = staffResult.rows[0];
+
+    const dutyResult = await pool.query(`SELECT * FROM duty_schedule WHERE id = 1`);
+    const duty = dutyResult.rows[0] || null;
+
+    const eventsResult = await pool.query(
+      `SELECT * FROM attendance_events
+       WHERE staff_id = $1 AND event_time >= (now() + interval '6 hours')::date - ($2 || ' days')::interval - interval '6 hours'
+       ORDER BY event_time ASC`,
+      [staffId, days]
+    );
+
+    const byDate = {};
+    for (const ev of eventsResult.rows) {
+      const d = bdDateStr(ev.event_time);
+      if (!byDate[d]) byDate[d] = [];
+      byDate[d].push(ev);
+    }
+
+    // যোগদানের তারিখ বা `days` দিন আগে — যেটা পরে, সেখান থেকে আজ পর্যন্ত প্রতিটা দিন তৈরি করা
+    const joining = new Date(staff.joining_date);
+    const rangeStart = new Date();
+    rangeStart.setDate(rangeStart.getDate() - (days - 1));
+    const startDate = joining > rangeStart ? joining : rangeStart;
+
+    const result = [];
+    for (let d = new Date(startDate); d <= new Date(); d.setDate(d.getDate() + 1)) {
+      const dateStr = bdDateStr(d);
+      const events = byDate[dateStr] || [];
+      if (events.length === 0) {
+        result.push({ date: dateStr, status: 'absent' });
+        continue;
+      }
+
+      const shift1Start = timeOnDate(dateStr, duty ? duty.shift1_start : '09:00');
+      const shift1End = timeOnDate(dateStr, duty ? duty.shift1_end : '14:00');
+      const shift1WindowEnd = new Date(shift1Start.getTime() + SHIFT_WINDOW_AFTER_MIN * 60000);
+      const shift2Start = timeOnDate(dateStr, duty ? duty.shift2_start : '15:00');
+      const shift2End = timeOnDate(dateStr, duty ? duty.shift2_end : '22:00');
+      const shift2WindowEnd = new Date(shift2Start.getTime() + SHIFT_WINDOW_AFTER_MIN * 60000);
+
+      const s1CheckIn = events.find((e) => e.shift === 1 && e.event_type === 'check_in');
+      const s1CheckOut = events.find((e) => e.shift === 1 && e.event_type === 'check_out');
+      const s2CheckIn = events.find((e) => e.shift === 2 && e.event_type === 'check_in');
+      const s2CheckOut = events.find((e) => e.shift === 2 && e.event_type === 'check_out');
+
+      const shift1Outcome = computeShiftOutcome(
+        s1CheckIn ? new Date(s1CheckIn.event_time) : null,
+        s1CheckOut ? new Date(s1CheckOut.event_time) : null,
+        shift1Start, shift1End, shift1WindowEnd, 0
+      );
+      const shift2Outcome = computeShiftOutcome(
+        s2CheckIn ? new Date(s2CheckIn.event_time) : null,
+        s2CheckOut ? new Date(s2CheckOut.event_time) : null,
+        shift2Start, shift2End, shift2WindowEnd, 0
+      );
+
+      if (!shift1Outcome.attended && !shift2Outcome.attended) {
+        result.push({ date: dateStr, status: 'absent' });
+        continue;
+      }
+
+      const now = new Date();
+      result.push({
+        date: dateStr,
+        status: 'present',
+        check_in: s1CheckIn ? s1CheckIn.event_time : null,
+        check_out: s2CheckOut ? s2CheckOut.event_time : (s1CheckOut ? s1CheckOut.event_time : null),
+        late_minutes: shift1Outcome.late_minutes + shift2Outcome.late_minutes,
+        shift1: {
+          ...shift1Outcome,
+          check_in: s1CheckIn ? s1CheckIn.event_time : null,
+          check_out: s1CheckOut ? s1CheckOut.event_time : null,
+          shift_end: now >= shift1End ? shift1End : null // চলমান শিফটে ফাঁকা থাকবে, শেষ হওয়া শিফটে ডিউটি-টাইম দেখাবে
+        },
+        shift2: {
+          ...shift2Outcome,
+          check_in: s2CheckIn ? s2CheckIn.event_time : null,
+          check_out: s2CheckOut ? s2CheckOut.event_time : null,
+          shift_end: now >= shift2End ? shift2End : null
+        }
+      });
+    }
+
+    result.reverse(); // সাম্প্রতিক তারিখ আগে
+    res.json({ status: 'ok', days: result });
+  } catch (err) {
+    res.status(500).json({ status: 'error', message: err.message });
+  }
+});
+
+// ==================== ম্যানুয়ালি উপস্থিতি যুক্ত করুন (একাধিক তারিখ, নির্দিষ্ট শিফট) ====================
+
+// নির্দিষ্ট স্টাফের জন্য একাধিক তারিখ + একটা শিফটে "উপস্থিত" যোগ করা হয় — যেন সত্যিকারের ফিঙ্গার পাঞ্চের মতোই
+// ক্লাসিফাই ও বেতনে যুক্ত হয় (অন-টাইম চেক-ইন হিসেবে রেকর্ড হবে, লেট গণনা হবে না)
+app.post('/api/attendance/manual-add', async (req, res) => {
+  try {
+    const { staff_id, dates, shift } = req.body;
+    if (!staff_id || !Array.isArray(dates) || dates.length === 0 || ![1, 2].includes(shift)) {
+      return res.status(400).json({ status: 'error', message: 'স্টাফ, তারিখ এবং শিফট দিতে হবে' });
+    }
+    const dutyResult = await pool.query(`SELECT * FROM duty_schedule WHERE id = 1`);
+    const duty = dutyResult.rows[0] || null;
+
+    let added = 0;
+    let skippedFuture = 0;
+    const now = new Date();
+    for (const dateStr of dates) {
+      const shiftStartHm = shift === 1 ? (duty ? duty.shift1_start : '09:00') : (duty ? duty.shift2_start : '15:00');
+      const shiftStart = timeOnDate(dateStr, shiftStartHm);
+
+      // শিফট এখনো শুরুই হয়নি এমন ভবিষ্যতের সময়ে "উপস্থিত" মার্ক করা যাবে না
+      if (shiftStart > now) {
+        skippedFuture++;
+        continue;
+      }
+
+      const existing = await pool.query(
+        `SELECT id FROM attendance_events WHERE staff_id = $1
+         AND (event_time + interval '6 hours')::date = $2::date AND shift = $3 AND event_type = 'check_in'`,
+        [staff_id, dateStr, shift]
+      );
+      if (existing.rows.length > 0) continue; // এই দিনে এই শিফটে ইতিমধ্যে এন্ট্রি আছে, স্কিপ
+
+      await pool.query(
+        `INSERT INTO attendance_events (staff_id, event_type, event_time, source, shift) VALUES ($1, 'check_in', $2, 'manual', $3)`,
+        [staff_id, shiftStart, shift]
+      );
+      added++;
+    }
+    res.json({ status: 'ok', added, skipped_future: skippedFuture });
+  } catch (err) {
+    res.status(500).json({ status: 'error', message: err.message });
+  }
+});
+
+// গত ৩ ঘণ্টায় কাকে কাকে ম্যানুয়ালি উপস্থিতি যোগ করা হয়েছে (স্টাফ লিস্টে ব্যাজ দেখানোর জন্য)
+app.get('/api/attendance/manual-add/recent', async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT DISTINCT staff_id FROM attendance_events
+       WHERE source = 'manual' AND created_at >= NOW() - INTERVAL '3 hours'`
+    );
+    res.json({ status: 'ok', staff_ids: result.rows.map((r) => r.staff_id) });
+  } catch (err) {
+    res.status(500).json({ status: 'error', message: err.message });
+  }
+});
+
+app.get('/api/duty-schedule', async (req, res) => {
+  try {
+    const result = await pool.query(`SELECT * FROM duty_schedule WHERE id = 1`);
+    res.json({ status: 'ok', schedule: result.rows[0] || null });
+  } catch (err) {
+    res.status(500).json({ status: 'error', message: err.message });
+  }
+});
+
+app.post('/api/duty-schedule', async (req, res) => {
+  try {
+    const { shift1_start, shift1_end, shift2_start, shift2_end } = req.body;
+    const result = await pool.query(
+      `INSERT INTO duty_schedule (id, shift1_start, shift1_end, shift2_start, shift2_end, updated_at)
+       VALUES (1, $1, $2, $3, $4, NOW())
+       ON CONFLICT (id) DO UPDATE SET
+         shift1_start = COALESCE(EXCLUDED.shift1_start, duty_schedule.shift1_start),
+         shift1_end = COALESCE(EXCLUDED.shift1_end, duty_schedule.shift1_end),
+         shift2_start = COALESCE(EXCLUDED.shift2_start, duty_schedule.shift2_start),
+         shift2_end = COALESCE(EXCLUDED.shift2_end, duty_schedule.shift2_end),
+         updated_at = NOW()
+       RETURNING *`,
+      [shift1_start || null, shift1_end || null, shift2_start || null, shift2_end || null]
+    );
+    res.json({ status: 'ok', schedule: result.rows[0] });
+  } catch (err) {
+    res.status(500).json({ status: 'error', message: err.message });
+  }
+});
+
+// ==================== সেটিংস (Settings) ====================
+
+app.get('/api/settings/sync-interval', async (req, res) => {
+  try {
+    const result = await pool.query(`SELECT value FROM settings WHERE key = 'machine_sync_interval_seconds'`);
+    const seconds = result.rows.length ? parseInt(result.rows[0].value) : 30;
+    res.json({ status: 'ok', sync_interval_seconds: seconds });
+  } catch (err) {
+    res.status(500).json({ status: 'error', message: err.message });
+  }
+});
+
+app.post('/api/settings/sync-interval', async (req, res) => {
+  try {
+    let { seconds } = req.body;
+    seconds = parseInt(seconds);
+    if (!seconds || isNaN(seconds)) {
+      return res.status(400).json({ status: 'error', message: 'সঠিক সেকেন্ড সংখ্যা দিন' });
+    }
+    // নিরাপত্তার জন্য সর্বনিম্ন ১০ সেকেন্ড — এর কম হলে মেশিন অস্থির হয়ে পড়তে পারে
+    if (seconds < 10) seconds = 10;
+    await pool.query(
+      `INSERT INTO settings (key, value) VALUES ('machine_sync_interval_seconds', $1)
+       ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
+      [String(seconds)]
+    );
+    res.json({ status: 'ok', sync_interval_seconds: seconds });
+  } catch (err) {
+    res.status(500).json({ status: 'error', message: err.message });
+  }
+});
+
+// ==================== ফিঙ্গারপ্রিন্ট মেশিন (Machines) ====================
+
+app.get('/api/machines', async (req, res) => {
+  try {
+    const result = await pool.query(`SELECT * FROM machines WHERE active = true ORDER BY created_at DESC`);
+    res.json({ status: 'ok', machines: result.rows });
+  } catch (err) {
+    res.status(500).json({ status: 'error', message: err.message });
+  }
+});
+
+app.post('/api/machines', async (req, res) => {
+  try {
+    const { name, ip_address, port } = req.body;
+    if (!name || !ip_address) {
+      return res.status(400).json({ status: 'error', message: 'নাম এবং IP অ্যাড্রেস দরকার' });
+    }
+    const result = await pool.query(
+      `INSERT INTO machines (name, ip_address, port) VALUES ($1, $2, $3) RETURNING *`,
+      [name, ip_address, port || 4370]
+    );
+    res.json({ status: 'ok', machine: result.rows[0] });
+  } catch (err) {
+    res.status(500).json({ status: 'error', message: err.message });
+  }
+});
+
+app.delete('/api/machines/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    await pool.query(`UPDATE machines SET active = false WHERE id = $1`, [id]);
+    res.json({ status: 'ok' });
+  } catch (err) {
+    res.status(500).json({ status: 'error', message: err.message });
+  }
+});
+
+// মেশিনের IP/পোর্ট আপডেট করুন (যেমন লোকাল IP থেকে পাবলিক IP-তে বদলাতে)
+app.put('/api/machines/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { name, ip_address, port } = req.body;
+    const result = await pool.query(
+      `UPDATE machines SET
+        name = COALESCE($1, name),
+        ip_address = COALESCE($2, ip_address),
+        port = COALESCE($3, port)
+       WHERE id = $4
+       RETURNING *`,
+      [name, ip_address, port, id]
+    );
+    if (result.rows.length === 0) {
+      return res.status(404).json({ status: 'error', message: 'মেশিন পাওয়া যায়নি' });
+    }
+    res.json({ status: 'ok', machine: result.rows[0] });
+  } catch (err) {
+    res.status(500).json({ status: 'error', message: err.message });
+  }
+});
+
+// মেশিন থেকে সিঙ্ক প্রোগ্রাম এই রুটে ব্যাচ আকারে attendance log পাঠাবে
+// body: { machine_id, logs: [{ staff_id বা employee_no, event_type, event_time }, ...] }
+app.post('/api/attendance/machine-sync', async (req, res) => {
+  try {
+    const { logs } = req.body;
+    if (!Array.isArray(logs) || logs.length === 0) {
+      return res.status(400).json({ status: 'error', message: 'logs অ্যারে দরকার' });
+    }
+    let inserted = 0;
+    for (const log of logs) {
+      if (!log.staff_id || !log.event_type || !log.event_time) continue;
+      await pool.query(
+        `INSERT INTO attendance_events (staff_id, event_type, event_time, source)
+         VALUES ($1, $2, $3, 'machine')`,
+        [log.staff_id, log.event_type, log.event_time]
+      );
+      inserted++;
+    }
+    res.json({ status: 'ok', inserted });
+  } catch (err) {
+    res.status(500).json({ status: 'error', message: err.message });
+  }
+});
+
+// ==================== প্রোডাক্ট (Products) ====================
+
+app.get('/api/products', async (req, res) => {
+  try {
+    const result = await pool.query(`SELECT * FROM products WHERE active = true ORDER BY created_at DESC`);
+    res.json({ status: 'ok', products: result.rows });
+  } catch (err) {
+    res.status(500).json({ status: 'error', message: err.message });
+  }
+});
+
+app.post('/api/products', async (req, res) => {
+  try {
+    const { name, sewing_price } = req.body;
+    if (!name) {
+      return res.status(400).json({ status: 'error', message: 'প্রোডাক্টের নাম দিতে হবে' });
+    }
+    const result = await pool.query(
+      `INSERT INTO products (name, sewing_price) VALUES ($1, $2) RETURNING *`,
+      [name, sewing_price || 0]
+    );
+    res.json({ status: 'ok', product: result.rows[0] });
+  } catch (err) {
+    res.status(500).json({ status: 'error', message: err.message });
+  }
+});
+
+app.put('/api/products/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { name, sewing_price, apply_to_existing } = req.body;
+    const result = await pool.query(
+      `UPDATE products SET
+        name = COALESCE($1, name),
+        sewing_price = COALESCE($2, sewing_price)
+       WHERE id = $3
+       RETURNING *`,
+      [name, sewing_price, id]
+    );
+    if (result.rows.length === 0) {
+      return res.status(404).json({ status: 'error', message: 'প্রোডাক্ট পাওয়া যায়নি' });
+    }
+    // "আগের হিসাবেও এই দাম যোগ করুন" — টিক দেওয়া থাকলে পুরনো সব এন্ট্রি নতুন দামে রিক্যালকুলেট হবে
+    if (apply_to_existing && sewing_price !== undefined) {
+      await pool.query(
+        `UPDATE production_entries SET sewing_price = $1, amount = quantity * $1 WHERE product_id = $2`,
+        [sewing_price, id]
+      );
+    }
+    res.json({ status: 'ok', product: result.rows[0] });
+  } catch (err) {
+    res.status(500).json({ status: 'error', message: err.message });
+  }
+});
+
+app.delete('/api/products/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const used = await pool.query(`SELECT COUNT(*) FROM production_entries WHERE product_id = $1`, [id]);
+    if (parseInt(used.rows[0].count) > 0) {
+      return res.status(400).json({
+        status: 'error',
+        message: 'এই প্রোডাক্ট দিয়ে ইতিমধ্যে কারিগরের হিসাব যোগ হয়ে গেছে, তাই ডিলিট করা যাবে না'
+      });
+    }
+    await pool.query(`UPDATE products SET active = false WHERE id = $1`, [id]);
+    res.json({ status: 'ok' });
+  } catch (err) {
+    res.status(500).json({ status: 'error', message: err.message });
+  }
+});
+
+// ==================== কারিগরের প্রোডাকশন এন্ট্রি ====================
+
+// নতুন প্রোডাকশন এন্ট্রি (কে, কোন প্রোডাক্ট, কত পিস) — অটো ক্যালকুলেশন
+app.post('/api/production', async (req, res) => {
+  try {
+    const { staff_id, product_id, quantity, entry_date } = req.body;
+    if (!staff_id || !product_id || !quantity) {
+      return res.status(400).json({ status: 'error', message: 'staff_id, product_id, quantity দরকার' });
+    }
+    const productResult = await pool.query(`SELECT * FROM products WHERE id = $1`, [product_id]);
+    if (productResult.rows.length === 0) {
+      return res.status(404).json({ status: 'error', message: 'প্রোডাক্ট পাওয়া যায়নি' });
+    }
+    const sewingPrice = parseFloat(productResult.rows[0].sewing_price);
+    const amount = sewingPrice * parseFloat(quantity);
+
+    const result = await pool.query(
+      `INSERT INTO production_entries (staff_id, product_id, quantity, sewing_price, amount, entry_date)
+       VALUES ($1, $2, $3, $4, $5, COALESCE($6, CURRENT_DATE))
+       RETURNING *`,
+      [staff_id, product_id, quantity, sewingPrice, amount, entry_date || null]
+    );
+    res.json({ status: 'ok', entry: result.rows[0] });
+  } catch (err) {
+    res.status(500).json({ status: 'error', message: err.message });
+  }
+});
+
+// একজন কারিগরের সব প্রোডাকশন এন্ট্রি (প্রোডাক্টের নামসহ)
+app.get('/api/production/staff/:staffId', async (req, res) => {
+  try {
+    const { staffId } = req.params;
+    const result = await pool.query(
+      `SELECT pe.*, p.name AS product_name
+       FROM production_entries pe
+       JOIN products p ON p.id = pe.product_id
+       WHERE pe.staff_id = $1
+       ORDER BY pe.entry_date DESC, pe.created_at DESC`,
+      [staffId]
+    );
+    res.json({ status: 'ok', entries: result.rows });
+  } catch (err) {
+    res.status(500).json({ status: 'error', message: err.message });
+  }
+});
+
+// একজন কারিগরের মোট প্রোডাকশন সামারি (মোট পিস, মোট টাকা)
+app.get('/api/production/staff/:staffId/summary', async (req, res) => {
+  try {
+    const { staffId } = req.params;
+    const result = await pool.query(
+      `SELECT COALESCE(SUM(quantity),0) AS total_quantity, COALESCE(SUM(amount),0) AS total_amount
+       FROM production_entries WHERE staff_id = $1`,
+      [staffId]
+    );
+    res.json({ status: 'ok', summary: result.rows[0] });
+  } catch (err) {
+    res.status(500).json({ status: 'error', message: err.message });
+  }
+});
+
+// সব কারিগরের প্রোডাকশন সামারি একসাথে (স্টাফ লিস্টে দেখানোর জন্য, বারবার কল করা এড়াতে)
+app.get('/api/production/summary-all', async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT staff_id, COALESCE(SUM(quantity),0) AS total_quantity, COALESCE(SUM(amount),0) AS total_amount
+       FROM production_entries GROUP BY staff_id`
+    );
+    res.json({ status: 'ok', summary: result.rows });
+  } catch (err) {
+    res.status(500).json({ status: 'error', message: err.message });
+  }
+});
+
+// একটা প্রোডাকশন এন্ট্রি এডিট করুন (পিস সংখ্যা বা প্রোডাক্ট বদলানো)
+app.put('/api/production/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { quantity, product_id, entry_date } = req.body;
+    const existingResult = await pool.query(`SELECT * FROM production_entries WHERE id = $1`, [id]);
+    if (existingResult.rows.length === 0) {
+      return res.status(404).json({ status: 'error', message: 'এন্ট্রি পাওয়া যায়নি' });
+    }
+    const existing = existingResult.rows[0];
+    let sewingPrice = parseFloat(existing.sewing_price);
+    let productId = existing.product_id;
+
+    if (product_id && product_id !== existing.product_id) {
+      const p = await pool.query(`SELECT sewing_price FROM products WHERE id = $1`, [product_id]);
+      if (p.rows.length === 0) {
+        return res.status(404).json({ status: 'error', message: 'প্রোডাক্ট পাওয়া যায়নি' });
+      }
+      sewingPrice = parseFloat(p.rows[0].sewing_price);
+      productId = product_id;
+    }
+
+    const qty = quantity !== undefined ? parseFloat(quantity) : parseFloat(existing.quantity);
+    const amount = qty * sewingPrice;
+
+    const result = await pool.query(
+      `UPDATE production_entries SET quantity = $1, product_id = $2, sewing_price = $3, amount = $4, entry_date = COALESCE($5, entry_date)
+       WHERE id = $6 RETURNING *`,
+      [qty, productId, sewingPrice, amount, entry_date || null, id]
+    );
+    res.json({ status: 'ok', entry: result.rows[0] });
+  } catch (err) {
+    res.status(500).json({ status: 'error', message: err.message });
+  }
+});
+
+// প্রতিটা স্টাফের সর্বশেষ প্রোডাকশন এন্ট্রি — শুধু নির্দিষ্ট সময়ের (ডিফল্ট ৩ ঘণ্টা) মধ্যে যোগ হলে দেখাবে
+app.get('/api/production/recent-all', async (req, res) => {
+  try {
+    const hours = parseInt(req.query.hours) || 3;
+    const result = await pool.query(
+      `SELECT DISTINCT ON (pe.staff_id) pe.*, p.name AS product_name
+       FROM production_entries pe
+       JOIN products p ON p.id = pe.product_id
+       WHERE pe.created_at >= NOW() - ($1 || ' hours')::interval
+       ORDER BY pe.staff_id, pe.created_at DESC`,
+      [hours]
+    );
+    res.json({ status: 'ok', recent: result.rows });
+  } catch (err) {
+    res.status(500).json({ status: 'error', message: err.message });
+  }
+});
+
+// ==================== ফ্যাক্টরি খরচ (Expenses) ====================
+
+app.get('/api/expenses', async (req, res) => {
+  try {
+    const result = await pool.query(`SELECT * FROM expenses ORDER BY expense_date DESC, created_at DESC LIMIT 100`);
+    res.json({ status: 'ok', expenses: result.rows });
+  } catch (err) {
+    res.status(500).json({ status: 'error', message: err.message });
+  }
+});
+
+app.post('/api/expenses', verifyAuthOptional, async (req, res) => {
+  try {
+    const { description, amount, expense_date } = req.body;
+    if (!description || !amount) {
+      return res.status(400).json({ status: 'error', message: 'বিবরণ এবং টাকার পরিমাণ দিতে হবে' });
+    }
+    const result = await pool.query(
+      `INSERT INTO expenses (description, amount, expense_date) VALUES ($1, $2, COALESCE($3, CURRENT_DATE)) RETURNING *`,
+      [description, amount, expense_date || null]
+    );
+
+    // যিনি লগইন করে এই খরচ যোগ করলেন তিনি পার্টনার হলে, এটা তার নিজের হিসাব থেকেও বাদ যাবে
+    if (req.user && req.user.is_partner) {
+      await createPartnerTransaction({
+        userId: req.user.id,
+        type: 'expense',
+        description: `ফ্যাক্টরি খরচ: ${description}`,
+        amount,
+        addedByUserId: req.user.id
+      });
+    }
+
+    res.json({ status: 'ok', expense: result.rows[0] });
+  } catch (err) {
+    res.status(500).json({ status: 'error', message: err.message });
+  }
+});
+
+// ==================== স্টাফ/কারিগরের সাপ্তাহিক পেমেন্ট (Advance) ====================
+
+app.post('/api/staff-payments', verifyAuthOptional, async (req, res) => {
+  try {
+    const { staff_id, amount, payment_date, note } = req.body;
+    if (!staff_id || !amount) {
+      return res.status(400).json({ status: 'error', message: 'staff_id এবং টাকার পরিমাণ দিতে হবে' });
+    }
+    const result = await pool.query(
+      `INSERT INTO staff_payments (staff_id, amount, payment_date, note)
+       VALUES ($1, $2, COALESCE($3, CURRENT_DATE), $4)
+       RETURNING *`,
+      [staff_id, amount, payment_date || null, note || null]
+    );
+
+    // যিনি লগইন করে এই পেমেন্ট দিলেন তিনি পার্টনার হলে, এটাও তার নিজের হিসাব থেকে বাদ যাবে
+    if (req.user && req.user.is_partner) {
+      const staffResult = await pool.query(`SELECT name FROM staff WHERE id = $1`, [staff_id]);
+      const staffName = staffResult.rows[0]?.name || 'স্টাফ';
+      await createPartnerTransaction({
+        userId: req.user.id,
+        type: 'expense',
+        description: `${staffName}-কে পেমেন্ট`,
+        amount,
+        addedByUserId: req.user.id
+      });
+    }
+
+    res.json({ status: 'ok', payment: result.rows[0] });
+  } catch (err) {
+    res.status(500).json({ status: 'error', message: err.message });
+  }
+});
+
+// সবার পেমেন্ট একসাথে (স্টাফের নামসহ) — সম্পূর্ণ খরচের রিপোর্টের জন্য
+app.get('/api/staff-payments', async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT sp.*, s.name AS staff_name
+       FROM staff_payments sp
+       JOIN staff s ON s.id = sp.staff_id
+       ORDER BY sp.payment_date DESC, sp.created_at DESC
+       LIMIT 200`
+    );
+    res.json({ status: 'ok', payments: result.rows });
+  } catch (err) {
+    res.status(500).json({ status: 'error', message: err.message });
+  }
+});
+
+// একজন স্টাফের সব পেমেন্ট হিস্ট্রি
+app.get('/api/staff-payments/staff/:staffId', async (req, res) => {
+  try {
+    const { staffId } = req.params;
+    const result = await pool.query(
+      `SELECT * FROM staff_payments WHERE staff_id = $1 ORDER BY payment_date DESC, created_at DESC`,
+      [staffId]
+    );
+    res.json({ status: 'ok', payments: result.rows });
+  } catch (err) {
+    res.status(500).json({ status: 'error', message: err.message });
+  }
+});
+
+// একটা পেমেন্ট এডিট করুন (টাকার পরিমাণ বদলানো)
+app.put('/api/staff-payments/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { amount, payment_date } = req.body;
+    const result = await pool.query(
+      `UPDATE staff_payments SET amount = COALESCE($1, amount), payment_date = COALESCE($2, payment_date) WHERE id = $3 RETURNING *`,
+      [amount, payment_date || null, id]
+    );
+    if (result.rows.length === 0) {
+      return res.status(404).json({ status: 'error', message: 'পেমেন্ট পাওয়া যায়নি' });
+    }
+    res.json({ status: 'ok', payment: result.rows[0] });
+  } catch (err) {
+    res.status(500).json({ status: 'error', message: err.message });
+  }
+});
+
+// প্রতিটা স্টাফের সর্বশেষ পেমেন্ট — শুধু নির্দিষ্ট সময়ের (ডিফল্ট ৩ ঘণ্টা) মধ্যে দেওয়া হলে দেখাবে
+app.get('/api/staff-payments/recent-all', async (req, res) => {
+  try {
+    const hours = parseInt(req.query.hours) || 3;
+    const result = await pool.query(
+      `SELECT DISTINCT ON (staff_id) *
+       FROM staff_payments
+       WHERE created_at >= NOW() - ($1 || ' hours')::interval
+       ORDER BY staff_id, created_at DESC`,
+      [hours]
+    );
+    res.json({ status: 'ok', recent: result.rows });
+  } catch (err) {
+    res.status(500).json({ status: 'error', message: err.message });
+  }
+});
+
+// একজন স্টাফের মোট পেমেন্ট সামারি
+app.get('/api/staff-payments/staff/:staffId/summary', async (req, res) => {
+  try {
+    const { staffId } = req.params;
+    const result = await pool.query(
+      `SELECT COALESCE(SUM(amount),0) AS total_paid, COUNT(*) AS payment_count
+       FROM staff_payments WHERE staff_id = $1`,
+      [staffId]
+    );
+    res.json({ status: 'ok', summary: result.rows[0] });
+  } catch (err) {
+    res.status(500).json({ status: 'error', message: err.message });
+  }
+});
+
+// সব স্টাফের পেমেন্ট সামারি একসাথে (মোট ব্যালেন্স হিসাব করার জন্য)
+app.get('/api/staff-payments/summary-all', async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT staff_id, COALESCE(SUM(amount),0) AS total_paid
+       FROM staff_payments GROUP BY staff_id`
+    );
+    res.json({ status: 'ok', summary: result.rows });
+  } catch (err) {
+    res.status(500).json({ status: 'error', message: err.message });
+  }
+});
+
+// ==================== মাসিক বেতনের কারিগরের মজুরি হিসাব ====================
+
+// একজন মাসিক বেতনের কারিগরের সম্পূর্ণ বিস্তারিত মজুরি হিসাব (ক্যাশ মেমোর জন্য)
+app.get('/api/salary/staff/:staffId/summary', async (req, res) => {
+  try {
+    const days = parseInt(req.query.days) || 30;
+    const result = await computeSalaryBreakdown(req.params.staffId, days);
+    if (!result) {
+      return res.status(404).json({ status: 'error', message: 'স্টাফ পাওয়া যায়নি' });
+    }
+    res.json({ status: 'ok', salary: result });
+  } catch (err) {
+    res.status(500).json({ status: 'error', message: err.message });
+  }
+});
+
+// সব মাসিক বেতনের কারিগরের মজুরি সামারি একসাথে (মোট ব্যালেন্স হিসাবের জন্য)
+app.get('/api/salary/summary-all', async (req, res) => {
+  try {
+    const days = parseInt(req.query.days) || 30;
+    const staffResult = await pool.query(
+      `SELECT id FROM staff WHERE active = true AND rate_type = 'monthly'`
+    );
+    const summaries = [];
+    for (const row of staffResult.rows) {
+      const s = await computeSalaryBreakdown(row.id, days);
+      if (s) {
+        summaries.push({
+          staff_id: s.staff_id,
+          total_salary_earned: s.total_salary_earned,
+          total_paid: s.total_paid,
+          total_due: s.total_due
+        });
+      }
+    }
+    res.json({ status: 'ok', summary: summaries });
+  } catch (err) {
+    res.status(500).json({ status: 'error', message: err.message });
+  }
+});
+
+// ==================== ওভারটাইম ====================
+
+// এই মুহূর্তে যাদের ওভারটাইম চলছে (এখনো শেষ হয়নি)
+app.get('/api/overtime/active', async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT os.*, s.name AS staff_name
+       FROM overtime_sessions os
+       JOIN staff s ON s.id = os.staff_id
+       WHERE os.end_time IS NULL
+       ORDER BY os.start_time ASC`
+    );
+    res.json({ status: 'ok', active: result.rows });
+  } catch (err) {
+    res.status(500).json({ status: 'error', message: err.message });
+  }
+});
+
+// আগের সব শেষ হওয়া ওভারটাইমের লগ/হিস্ট্রি
+app.get('/api/overtime/log', async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT os.*, s.name AS staff_name
+       FROM overtime_sessions os
+       JOIN staff s ON s.id = os.staff_id
+       WHERE os.end_time IS NOT NULL
+       ORDER BY os.end_time DESC
+       LIMIT 100`
+    );
+    res.json({ status: 'ok', log: result.rows });
+  } catch (err) {
+    res.status(500).json({ status: 'error', message: err.message });
+  }
+});
+
+// ==================== পাইকার (Wholesaler) ====================
+
+app.get('/api/wholesalers', async (req, res) => {
+  try {
+    const result = await pool.query(`SELECT * FROM wholesalers ORDER BY created_at DESC`);
+    res.json({ status: 'ok', wholesalers: result.rows });
+  } catch (err) {
+    res.status(500).json({ status: 'error', message: err.message });
+  }
+});
+
+app.post('/api/wholesalers', async (req, res) => {
+  try {
+    const { name, address, phone } = req.body;
+    if (!name) {
+      return res.status(400).json({ status: 'error', message: 'পাইকারের নাম দিতে হবে' });
+    }
+    const result = await pool.query(
+      `INSERT INTO wholesalers (name, address, phone) VALUES ($1, $2, $3) RETURNING *`,
+      [name, address || null, phone || null]
+    );
+    res.json({ status: 'ok', wholesaler: result.rows[0] });
+  } catch (err) {
+    res.status(500).json({ status: 'error', message: err.message });
+  }
+});
+
+// একজন পাইকারের প্রোডাক্ট রেট লিস্ট
+app.get('/api/wholesalers/:id/rates', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const result = await pool.query(
+      `SELECT * FROM wholesaler_product_rates WHERE wholesaler_id = $1 ORDER BY created_at DESC`,
+      [id]
+    );
+    res.json({ status: 'ok', rates: result.rows });
+  } catch (err) {
+    res.status(500).json({ status: 'error', message: err.message });
+  }
+});
+
+// একজন পাইকারের জন্য নতুন প্রোডাক্ট রেট যোগ করুন
+app.post('/api/wholesalers/:id/rates', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { product_name, price } = req.body;
+    if (!product_name || !price) {
+      return res.status(400).json({ status: 'error', message: 'প্রোডাক্টের নাম এবং দাম দিতে হবে' });
+    }
+    const result = await pool.query(
+      `INSERT INTO wholesaler_product_rates (wholesaler_id, product_name, price) VALUES ($1, $2, $3) RETURNING *`,
+      [id, product_name, price]
+    );
+    res.json({ status: 'ok', rate: result.rows[0] });
+  } catch (err) {
+    res.status(500).json({ status: 'error', message: err.message });
+  }
+});
+
+// একটা প্রোডাক্ট রেট এডিট করুন
+app.put('/api/wholesalers/rates/:rateId', async (req, res) => {
+  try {
+    const { rateId } = req.params;
+    const { product_name, price } = req.body;
+    const result = await pool.query(
+      `UPDATE wholesaler_product_rates SET
+        product_name = COALESCE($1, product_name),
+        price = COALESCE($2, price)
+       WHERE id = $3
+       RETURNING *`,
+      [product_name || null, price || null, rateId]
+    );
+    if (result.rows.length === 0) {
+      return res.status(404).json({ status: 'error', message: 'রেট পাওয়া যায়নি' });
+    }
+    res.json({ status: 'ok', rate: result.rows[0] });
+  } catch (err) {
+    res.status(500).json({ status: 'error', message: err.message });
+  }
+});
+
+// ==================== পাইকারি হিসাব (লেজার) ====================
+
+// একজন পাইকারের সব এন্ট্রি (হিসাব যোগ + রিটার্ন + পেমেন্ট) — লগ আকারে
+app.get('/api/wholesalers/:id/ledger', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const result = await pool.query(
+      `SELECT wl.*, u.name AS added_by_name
+       FROM wholesaler_ledger wl
+       LEFT JOIN users u ON u.id = wl.added_by_user_id
+       WHERE wl.wholesaler_id = $1
+       ORDER BY wl.event_time DESC, wl.created_at DESC`,
+      [id]
+    );
+    res.json({ status: 'ok', ledger: result.rows });
+  } catch (err) {
+    res.status(500).json({ status: 'error', message: err.message });
+  }
+});
+
+// একজন পাইকারের সামারি — মোট মূল্য, মোট পরিশোধ, বর্তমান দেনা
+app.get('/api/wholesalers/:id/summary', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const result = await pool.query(
+      `SELECT entry_type, COALESCE(SUM(amount), 0) AS total FROM wholesaler_ledger WHERE wholesaler_id = $1 GROUP BY entry_type`,
+      [id]
+    );
+    let addTotal = 0, returnTotal = 0, paidTotal = 0;
+    for (const row of result.rows) {
+      if (row.entry_type === 'add') addTotal = parseFloat(row.total);
+      if (row.entry_type === 'return') returnTotal = parseFloat(row.total);
+      if (row.entry_type === 'payment') paidTotal = parseFloat(row.total);
+    }
+    const totalValue = addTotal - returnTotal;
+    const currentDue = totalValue - paidTotal;
+    res.json({
+      status: 'ok',
+      summary: {
+        total_value: +totalValue.toFixed(2),
+        total_paid: +paidTotal.toFixed(2),
+        current_due: +currentDue.toFixed(2)
+      }
+    });
+  } catch (err) {
+    res.status(500).json({ status: 'error', message: err.message });
+  }
+});
+
+// হিসাব যোগ করুন — নির্দিষ্ট প্রোডাক্ট থেকে পিস সংখ্যা দিয়ে, মোট মূল্যে যোগ হবে
+app.post('/api/wholesalers/:id/ledger/add', verifyAuthOptional, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { product_name, quantity } = req.body;
+    if (!product_name || !quantity) {
+      return res.status(400).json({ status: 'error', message: 'প্রোডাক্ট এবং পিস সংখ্যা দিতে হবে' });
+    }
+    const rateResult = await pool.query(
+      `SELECT price FROM wholesaler_product_rates WHERE wholesaler_id = $1 AND product_name = $2 ORDER BY created_at DESC LIMIT 1`,
+      [id, product_name]
+    );
+    if (rateResult.rows.length === 0) {
+      return res.status(400).json({ status: 'error', message: 'এই প্রোডাক্টের রেট পাওয়া যায়নি' });
+    }
+    const price = parseFloat(rateResult.rows[0].price);
+    const amount = price * parseFloat(quantity);
+    const result = await pool.query(
+      `INSERT INTO wholesaler_ledger (wholesaler_id, entry_type, product_name, quantity, price_per_unit, amount, added_by_user_id)
+       VALUES ($1, 'add', $2, $3, $4, $5, $6) RETURNING *`,
+      [id, product_name, quantity, price, amount, req.user ? req.user.id : null]
+    );
+    res.json({ status: 'ok', entry: result.rows[0] });
+  } catch (err) {
+    res.status(500).json({ status: 'error', message: err.message });
+  }
+});
+
+// রিটার্ন যোগ করুন — মোট মূল্য থেকে বাদ যাবে
+app.post('/api/wholesalers/:id/ledger/return', verifyAuthOptional, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { product_name, quantity } = req.body;
+    if (!product_name || !quantity) {
+      return res.status(400).json({ status: 'error', message: 'প্রোডাক্ট এবং পিস সংখ্যা দিতে হবে' });
+    }
+    const rateResult = await pool.query(
+      `SELECT price FROM wholesaler_product_rates WHERE wholesaler_id = $1 AND product_name = $2 ORDER BY created_at DESC LIMIT 1`,
+      [id, product_name]
+    );
+    if (rateResult.rows.length === 0) {
+      return res.status(400).json({ status: 'error', message: 'এই প্রোডাক্টের রেট পাওয়া যায়নি' });
+    }
+    const price = parseFloat(rateResult.rows[0].price);
+    const amount = price * parseFloat(quantity);
+    const result = await pool.query(
+      `INSERT INTO wholesaler_ledger (wholesaler_id, entry_type, product_name, quantity, price_per_unit, amount, added_by_user_id)
+       VALUES ($1, 'return', $2, $3, $4, $5, $6) RETURNING *`,
+      [id, product_name, quantity, price, amount, req.user ? req.user.id : null]
+    );
+    res.json({ status: 'ok', entry: result.rows[0] });
+  } catch (err) {
+    res.status(500).json({ status: 'error', message: err.message });
+  }
+});
+
+// পেমেন্ট করুন — মোট পরিশোধে যোগ হবে
+app.post('/api/wholesalers/:id/ledger/payment', verifyAuthOptional, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { description, amount } = req.body;
+    if (!description || !amount) {
+      return res.status(400).json({ status: 'error', message: 'বিবরণ এবং টাকার পরিমাণ দিতে হবে' });
+    }
+    const result = await pool.query(
+      `INSERT INTO wholesaler_ledger (wholesaler_id, entry_type, description, amount, added_by_user_id)
+       VALUES ($1, 'payment', $2, $3, $4) RETURNING *`,
+      [id, description, amount, req.user ? req.user.id : null]
+    );
+
+    // যিনি লগইন করে এই পেমেন্ট রিসিভ করলেন তিনি পার্টনার হলে, এটা তার নিজের ক্যাশেও যোগ হবে
+    if (req.user && req.user.is_partner) {
+      const wholesalerResult = await pool.query(`SELECT name FROM wholesalers WHERE id = $1`, [id]);
+      const wholesalerName = wholesalerResult.rows[0]?.name || 'পাইকার';
+      await createPartnerTransaction({
+        userId: req.user.id,
+        type: 'cash_in',
+        description: `${wholesalerName} থেকে পেমেন্ট রিসিভ: ${description}`,
+        amount,
+        addedByUserId: req.user.id
+      });
+    }
+
+    res.json({ status: 'ok', entry: result.rows[0] });
+  } catch (err) {
+    res.status(500).json({ status: 'error', message: err.message });
+  }
+});
+
+// একটা লেজার এন্ট্রি এডিট করুন
+app.put('/api/wholesalers/ledger/:entryId', async (req, res) => {
+  try {
+    const { entryId } = req.params;
+    const existing = await pool.query(`SELECT * FROM wholesaler_ledger WHERE id = $1`, [entryId]);
+    if (existing.rows.length === 0) {
+      return res.status(404).json({ status: 'error', message: 'এন্ট্রি পাওয়া যায়নি' });
+    }
+    const entry = existing.rows[0];
+
+    if (entry.entry_type === 'payment') {
+      const { description, amount } = req.body;
+      const result = await pool.query(
+        `UPDATE wholesaler_ledger SET
+          description = COALESCE($1, description),
+          amount = COALESCE($2, amount)
+         WHERE id = $3 RETURNING *`,
+        [description || null, amount || null, entryId]
+      );
+      return res.json({ status: 'ok', entry: result.rows[0] });
+    }
+
+    // add/return টাইপের জন্য — পিস সংখ্যা বদলালে দাম দিয়ে গুণ করে নতুন amount বসবে
+    const { quantity } = req.body;
+    const newQuantity = quantity !== undefined ? parseFloat(quantity) : parseFloat(entry.quantity);
+    const newAmount = newQuantity * parseFloat(entry.price_per_unit);
+    const result = await pool.query(
+      `UPDATE wholesaler_ledger SET quantity = $1, amount = $2 WHERE id = $3 RETURNING *`,
+      [newQuantity, newAmount, entryId]
+    );
+    res.json({ status: 'ok', entry: result.rows[0] });
+  } catch (err) {
+    res.status(500).json({ status: 'error', message: err.message });
+  }
+});
+
+// একটা লেজার এন্ট্রি ডিলিট করুন
+app.delete('/api/wholesalers/ledger/:entryId', async (req, res) => {
+  try {
+    const { entryId } = req.params;
+    await pool.query(`DELETE FROM wholesaler_ledger WHERE id = $1`, [entryId]);
+    res.json({ status: 'ok' });
+  } catch (err) {
+    res.status(500).json({ status: 'error', message: err.message });
+  }
+});
+
+// সিলেক্ট করা স্টাফদের জন্য ওভারটাইম শুরু করুন
+app.post('/api/overtime/start', async (req, res) => {
+  try {
+    const { staff_ids } = req.body;
+    if (!Array.isArray(staff_ids) || staff_ids.length === 0) {
+      return res.status(400).json({ status: 'error', message: 'অন্তত একজন স্টাফ সিলেক্ট করতে হবে' });
+    }
+    let started = 0;
+    for (const staffId of staff_ids) {
+      // আগে থেকে চলমান সেশন থাকলে আবার নতুন করে শুরু করা হবে না
+      const existing = await pool.query(
+        `SELECT id FROM overtime_sessions WHERE staff_id = $1 AND end_time IS NULL`,
+        [staffId]
+      );
+      if (existing.rows.length === 0) {
+        await pool.query(`INSERT INTO overtime_sessions (staff_id, start_time) VALUES ($1, NOW())`, [staffId]);
+        started++;
+      }
+    }
+    res.json({ status: 'ok', started });
+  } catch (err) {
+    res.status(500).json({ status: 'error', message: err.message });
+  }
+});
+
+// চলমান সব ওভারটাইম একসাথে শেষ করুন — ঘণ্টা ও টাকা হিসাব করে বেতনে যোগ হয়ে যাবে
+app.post('/api/overtime/end', async (req, res) => {
+  try {
+    const activeResult = await pool.query(`SELECT * FROM overtime_sessions WHERE end_time IS NULL`);
+    const dutyResult = await pool.query(`SELECT * FROM duty_schedule WHERE id = 1`);
+    const duty = dutyResult.rows[0] || null;
+
+    const ended = [];
+    for (const session of activeResult.rows) {
+      const staffResult = await pool.query(`SELECT * FROM staff WHERE id = $1`, [session.staff_id]);
+      if (staffResult.rows.length === 0) continue;
+      const staff = staffResult.rows[0];
+      const { hourlyRate } = computeRates(staff, duty);
+
+      const endTime = new Date();
+      const hours = (endTime - new Date(session.start_time)) / (1000 * 60 * 60);
+      const amount = hours * hourlyRate;
+
+      await pool.query(
+        `UPDATE overtime_sessions SET end_time = $1, hours = $2, amount = $3 WHERE id = $4`,
+        [endTime, hours.toFixed(2), amount.toFixed(2), session.id]
+      );
+      ended.push({ staff_id: session.staff_id, staff_name: staff.name, hours: +hours.toFixed(2), amount: +amount.toFixed(2) });
+    }
+
+    res.json({ status: 'ok', ended });
+  } catch (err) {
+    res.status(500).json({ status: 'error', message: err.message });
+  }
+});
+
+// ==================== মোট ব্যালেন্সের মাসভিত্তিক ট্রেন্ড ====================
+
+// একটা নির্দিষ্ট মাসে (শুরু থেকে শেষ পর্যন্ত) নেট কত টাকা পাওনা বেড়েছে (আয় − পেমেন্ট) হিসাব করে
+async function computeMonthlyNet(monthStart, monthEndExclusive) {
+  const prodResult = await pool.query(
+    `SELECT COALESCE(SUM(amount),0) AS total FROM production_entries WHERE entry_date >= $1 AND entry_date < $2`,
+    [monthStart, monthEndExclusive]
+  );
+  const productionEarned = parseFloat(prodResult.rows[0].total);
+
+  const staffResult = await pool.query(
+    `SELECT id, rate_amount, joining_date FROM staff WHERE active = true AND rate_type = 'monthly'`
+  );
+  let salaryEarned = 0;
+  const today = new Date();
+  const rangeEnd = monthEndExclusive < today ? monthEndExclusive : today; // ভবিষ্যতের দিন গণনা করা হবে না
+  for (const s of staffResult.rows) {
+    const joining = new Date(s.joining_date);
+    const effectiveStart = joining > monthStart ? joining : monthStart;
+    if (effectiveStart >= rangeEnd) continue;
+    const daysElapsed = Math.max(0, Math.ceil((rangeEnd - effectiveStart) / (1000 * 60 * 60 * 24)));
+    const dailyRate = parseFloat(s.rate_amount || 0) / 30;
+    salaryEarned += dailyRate * daysElapsed;
+  }
+
+  const payResult = await pool.query(
+    `SELECT COALESCE(SUM(amount),0) AS total FROM staff_payments WHERE payment_date >= $1 AND payment_date < $2`,
+    [monthStart, monthEndExclusive]
+  );
+  const paid = parseFloat(payResult.rows[0].total);
+
+  return (productionEarned + salaryEarned) - paid;
+}
+
+app.get('/api/balance/trend', async (req, res) => {
+  try {
+    const now = new Date();
+    const thisMonthStart = new Date(now.getFullYear(), now.getMonth(), 1);
+    const nextMonthStart = new Date(now.getFullYear(), now.getMonth() + 1, 1);
+    const lastMonthStart = new Date(now.getFullYear(), now.getMonth() - 1, 1);
+
+    const thisMonthNet = await computeMonthlyNet(thisMonthStart, nextMonthStart);
+    const lastMonthNet = await computeMonthlyNet(lastMonthStart, thisMonthStart);
+
+    let percentChange = 0;
+    if (lastMonthNet !== 0) {
+      percentChange = ((thisMonthNet - lastMonthNet) / Math.abs(lastMonthNet)) * 100;
+    } else if (thisMonthNet !== 0) {
+      percentChange = 100;
+    }
+
+    res.json({
+      status: 'ok',
+      this_month_net: +thisMonthNet.toFixed(2),
+      last_month_net: +lastMonthNet.toFixed(2),
+      percent_change: +percentChange.toFixed(1),
+      direction: thisMonthNet >= lastMonthNet ? 'up' : 'down'
+    });
+  } catch (err) {
+    res.status(500).json({ status: 'error', message: err.message });
+  }
+});
+
+app.get('/', (req, res) => {
+  res.send('Factory Backend চলছে ✅');
+});
+
+// ==================== ফিঙ্গারপ্রিন্ট মেশিন সিঙ্ক (Cloud থেকে সরাসরি, Port Forwarding দিয়ে) ====================
+// এই ব্যাকএন্ডই সরাসরি মেশিনের পাবলিক IP:পোর্টে কানেক্ট করে ডেটা টেনে আনে, কোনো পিসির দরকার নেই
+
+const PUNCH_COOLDOWN_MS = 60 * 60 * 1000; // একবার পাঞ্চ দেওয়ার পর ১ ঘণ্টার মধ্যে নতুন পাঞ্চ গণনা করা হয় না
+const SHIFT_WINDOW_BEFORE_MIN = 30; // শিফটের এই কতক্ষণ আগে থেকে পাঞ্চ বৈধ ধরা হবে (এর আগে দিলে অন্য কিছু, যেমন লাঞ্চের পাঞ্চ ধরে নেওয়া হবে)
+const SHIFT_WINDOW_AFTER_MIN = 20; // শিফট শুরুর কতক্ষণ পর পর্যন্ত পৌঁছানো "অন টাইম" ধরা হবে (আগে পৌঁছালে সবসময়ই অন টাইম)
+const NEAR_END_TOLERANCE_MIN = 26; // শিফট শেষের এই সময়ের মধ্যে পাঞ্চ দিলে স্বাভাবিক "ডিউটি শেষ" ধরা হবে, মাঝপথে চলে যাওয়া না
+
+// একটা নির্দিষ্ট তারিখে HH:MM (বাংলাদেশ সময়) সময়টাকে সঠিক UTC Date অবজেক্টে রূপান্তর করে।
+// সার্ভার UTC-তে চলে বলে "YYYY-MM-DDTHH:MM" আক্ষরিকভাবে UTC ধরে নেয়, তাই ৬ ঘণ্টা বিয়োগ করে ঠিক করা হচ্ছে।
+function timeOnDate(dateStr, hm) {
+  return new Date(new Date(`${dateStr}T${hm}`).getTime() - TIMEZONE_CORRECTION_MS);
+}
+
+// দুই-শিফট মডেল অনুযায়ী পাঞ্চ ক্লাসিফিকেশন — প্রতিটা শিফট আলাদাভাবে (check_in + check_out) ট্র্যাক করা হয়।
+// শিফট-১ জোন: দিনের শুরু থেকে শিফট-১ শেষ পর্যন্ত; শিফট-২ জোন: তারপর থেকে দিনশেষ পর্যন্ত।
+// প্রতিটা শিফটে প্রথম পাঞ্চ = চেক-ইন (উইন্ডোর মধ্যে/আগে হলে শিফট-শুরুর সময়ই রেকর্ড হবে, দেরি হলে আসল সময়),
+// দ্বিতীয় পাঞ্চ = চেক-আউট (স্বাভাবিক শেষ নাকি মাঝপথে চলে যাওয়া — সেটা পরে বেতন হিসাবের সময় নির্ধারণ হয়)।
+async function classifyAndInsertPunches(staffId, dateStr, newPunchTimes, duty) {
+  const existingResult = await pool.query(
+    `SELECT * FROM attendance_events WHERE staff_id = $1 AND (event_time + interval '6 hours')::date = $2::date ORDER BY event_time ASC`,
+    [staffId, dateStr]
+  );
+  const existingEvents = existingResult.rows;
+
+  const shift1Start = timeOnDate(dateStr, duty ? duty.shift1_start : '09:00');
+  const shift1End = timeOnDate(dateStr, duty ? duty.shift1_end : '14:00');
+  const shift2Start = timeOnDate(dateStr, duty ? duty.shift2_start : '15:00');
+  const shift2End = timeOnDate(dateStr, duty ? duty.shift2_end : '22:00');
+
+  const shift1WindowStart = new Date(shift1Start.getTime() - SHIFT_WINDOW_BEFORE_MIN * 60000);
+  const shift1WindowEnd = new Date(shift1Start.getTime() + SHIFT_WINDOW_AFTER_MIN * 60000);
+  const shift2WindowStart = new Date(shift2Start.getTime() - SHIFT_WINDOW_BEFORE_MIN * 60000);
+  const shift2WindowEnd = new Date(shift2Start.getTime() + SHIFT_WINDOW_AFTER_MIN * 60000);
+
+  // শিফট-১ শেষের সময়টাই দুই জোনের সীমানা
+  const zoneBoundary = shift1End;
+
+  const shift1Existing = existingEvents.filter((e) => new Date(e.event_time) < zoneBoundary);
+  const shift2Existing = existingEvents.filter((e) => new Date(e.event_time) >= zoneBoundary);
+
+  const sortedNew = [...newPunchTimes].map((t) => new Date(t)).sort((a, b) => a - b);
+  const shift1New = sortedNew.filter((t) => t < zoneBoundary);
+  const shift2New = sortedNew.filter((t) => t >= zoneBoundary);
+
+  let inserted = 0;
+
+  async function processShift(existingShiftEvents, newShiftPunches, shiftNum, startDt, windowStartDt, windowEndDt) {
+    let checkIn = existingShiftEvents.find((e) => e.event_type === 'check_in') || null;
+    let checkOut = existingShiftEvents.find((e) => e.event_type === 'check_out') || null;
+    let lastAccepted = existingShiftEvents.length
+      ? new Date(existingShiftEvents[existingShiftEvents.length - 1].event_time)
+      : null;
+
+    for (const t of newShiftPunches) {
+      if (lastAccepted && (t - lastAccepted) < PUNCH_COOLDOWN_MS) continue;
+      if (checkIn && checkOut) continue; // এই শিফটে ইতিমধ্যে ঢোকা-বের হওয়া দুটোই হয়ে গেছে
+
+      if (!checkIn) {
+        // শিফটের উইন্ডো শুরুর অনেক আগে (যেমন লাঞ্চ ব্রেকে) পাঞ্চ দিলে সেটা এই শিফটের বৈধ চেক-ইন না —
+        // উপেক্ষা করা হচ্ছে, যাতে লাঞ্চের ফিঙ্গার ভুলবশত "শিফট শুরু" হিসেবে রেকর্ড না হয়
+        if (t < windowStartDt) continue;
+        // প্রথম পাঞ্চ = চেক-ইন। উইন্ডোর মধ্যে/আগে হলে শিফট-শুরুর সময়ই দেখানো হবে, দেরি হলে আসল সময়
+        const effectiveTime = t <= windowEndDt ? startDt : t;
+        await pool.query(
+          `INSERT INTO attendance_events (staff_id, event_type, event_time, source, shift) VALUES ($1, 'check_in', $2, 'machine', $3)`,
+          [staffId, effectiveTime, shiftNum]
+        );
+        checkIn = { event_type: 'check_in', event_time: effectiveTime };
+        inserted++;
+        lastAccepted = t;
+      } else {
+        // দ্বিতীয় পাঞ্চ = চেক-আউট (স্বাভাবিক শেষ / মাঝপথে চলে যাওয়া — বেতন হিসাবের সময় নির্ধারণ হবে)
+        await pool.query(
+          `INSERT INTO attendance_events (staff_id, event_type, event_time, source, shift) VALUES ($1, 'check_out', $2, 'machine', $3)`,
+          [staffId, t, shiftNum]
+        );
+        checkOut = { event_type: 'check_out', event_time: t };
+        inserted++;
+        lastAccepted = t;
+      }
+    }
+  }
+
+  await processShift(shift1Existing, shift1New, 1, shift1Start, shift1WindowStart, shift1WindowEnd);
+  await processShift(shift2Existing, shift2New, 2, shift2Start, shift2WindowStart, shift2WindowEnd);
+
+  return inserted;
+}
+
+// একটা শিফটের চেক-ইন/চেক-আউট থেকে লেট, মাঝপথে-চলে-যাওয়া, কাজ করা সময়, এবং সেই শিফটের বেতন বের করে
+function computeShiftOutcome(checkInTime, checkOutTime, shiftStartDt, shiftEndDt, windowEndDt, halfDailyRate) {
+  const shiftDurationMinutes = Math.max(1, Math.round((shiftEndDt - shiftStartDt) / 60000));
+  const perMinuteRate = halfDailyRate / shiftDurationMinutes;
+
+  if (!checkInTime) {
+    return { attended: false, late_minutes: 0, is_partial: false, worked_minutes: 0, pay: 0 };
+  }
+
+  const lateMinutes = Math.max(0, Math.round((checkInTime - windowEndDt) / 60000));
+
+  if (!checkOutTime) {
+    // শুধু চেক-ইন হয়েছে, চেক-আউট নেই — পুরো শিফট হয়েছে ধরে নেওয়া হবে
+    const pay = Math.max(0, halfDailyRate - lateMinutes * perMinuteRate);
+    return { attended: true, late_minutes: lateMinutes, is_partial: false, worked_minutes: shiftDurationMinutes, pay: +pay.toFixed(2) };
+  }
+
+  const minutesBeforeEnd = Math.round((shiftEndDt - checkOutTime) / 60000);
+  const isPartial = minutesBeforeEnd > NEAR_END_TOLERANCE_MIN;
+
+  if (isPartial) {
+    // মাঝপথে চলে যাওয়া — যতটুকু কাজ করেছে সেই অনুপাতে আংশিক বেতন
+    const workedMinutes = Math.max(0, Math.round((checkOutTime - checkInTime) / 60000));
+    const pay = (workedMinutes / shiftDurationMinutes) * halfDailyRate;
+    return { attended: true, late_minutes: lateMinutes, is_partial: true, worked_minutes: workedMinutes, pay: +pay.toFixed(2) };
+  }
+
+  // স্বাভাবিক শিফট শেষ
+  const pay = Math.max(0, halfDailyRate - lateMinutes * perMinuteRate);
+  return { attended: true, late_minutes: lateMinutes, is_partial: false, worked_minutes: shiftDurationMinutes, pay: +pay.toFixed(2) };
+}
+
+async function syncOneMachine(machine) {
+  const zkInstance = new ZKLib(machine.ip_address, machine.port, 10000, 4000);
+  try {
+    console.log(`[মেশিন সিঙ্ক] ${machine.name} (${machine.ip_address}:${machine.port})-এর সাথে কানেক্ট করছি...`);
+    await zkInstance.createSocket();
+
+    const attendances = await zkInstance.getAttendances();
+    const rawLogs = attendances.data || [];
+
+    const newLogs = machine.last_synced_at
+      ? rawLogs.filter((l) => new Date(l.recordTime) > new Date(machine.last_synced_at))
+      : rawLogs;
+
+    if (newLogs.length === 0) {
+      await zkInstance.disconnect();
+      console.log(`[মেশিন সিঙ্ক] ${machine.name}: নতুন কোনো লগ নেই`);
+      return;
+    }
+
+    // ইউজার আইডি → staff_id ম্যাপিং
+    const staffResult = await pool.query(`SELECT id, machine_user_id FROM staff WHERE machine_user_id IS NOT NULL`);
+    const userMapping = {};
+    for (const s of staffResult.rows) userMapping[String(s.machine_user_id)] = s.id;
+
+    // ডিউটি শিডিউল (জোন হিসাব করার জন্য)
+    const dutyResult = await pool.query(`SELECT * FROM duty_schedule WHERE id = 1`);
+    const duty = dutyResult.rows[0] || null;
+
+    // ইউজার + তারিখ অনুযায়ী গ্রুপ করা
+    // গুরুত্বপূর্ণ: মেশিনের ঘড়ি বাংলাদেশ সময়ে (UTC+৬) সেট করা, কিন্তু আমাদের সার্ভার UTC-তে চলে।
+    // node-zklib যে recordTime দেয় সেটা ভুলবশত UTC হিসেবে ধরা হয়ে যায়, তাই এখানে ৬ ঘণ্টা বিয়োগ করে
+    // সঠিক UTC সময়ে রূপান্তর করা হচ্ছে (এতে অ্যাপে সঠিক বাংলাদেশ সময় দেখাবে)।
+    const grouped = {};
+    for (const log of newLogs) {
+      const correctedTime = new Date(new Date(log.recordTime).getTime() - TIMEZONE_CORRECTION_MS);
+      const day = bdDateStr(correctedTime);
+      const key = `${log.deviceUserId}_${day}`;
+      if (!grouped[key]) grouped[key] = { deviceUserId: log.deviceUserId, day, punches: [] };
+      grouped[key].punches.push(correctedTime.toISOString());
+    }
+
+    let inserted = 0;
+    for (const key of Object.keys(grouped)) {
+      const { deviceUserId, day, punches } = grouped[key];
+      const staffId = userMapping[String(deviceUserId)];
+      if (!staffId) continue;
+      inserted += await classifyAndInsertPunches(staffId, day, punches, duty);
+    }
+
+    const latestTime = newLogs.reduce(
+      (max, l) => (new Date(l.recordTime) > new Date(max) ? l.recordTime : max),
+      newLogs[0].recordTime
+    );
+    await pool.query(`UPDATE machines SET last_synced_at = $1 WHERE id = $2`, [latestTime, machine.id]);
+
+    await zkInstance.disconnect();
+    console.log(`[মেশিন সিঙ্ক] ${machine.name}: ${inserted}টা ইভেন্ট যোগ হলো ✅`);
+  } catch (err) {
+    console.error(`[মেশিন সিঙ্ক] ${machine.name}-এর সাথে সমস্যা হয়েছে:`, err.message);
+  }
+}
+
+async function runAllMachineSync() {
+  try {
+    const result = await pool.query(`SELECT * FROM machines WHERE active = true`);
+    for (const machine of result.rows) {
+      await syncOneMachine(machine);
+    }
+  } catch (err) {
+    console.error('মেশিন সিঙ্ক চালাতে সমস্যা হয়েছে:', err.message);
+  }
+}
+
+// অ্যাপে সেট করা ইন্টারভাল অনুযায়ী বারবার সিঙ্ক করে — সেটিংস বদলালে সাথে সাথেই কাজ করবে,
+// আলাদা করে রিডিপ্লয় করা লাগবে না
+async function scheduleNextSync() {
+  await runAllMachineSync();
+  let seconds = 30;
+  try {
+    const result = await pool.query(`SELECT value FROM settings WHERE key = 'machine_sync_interval_seconds'`);
+    if (result.rows.length) seconds = Math.max(10, parseInt(result.rows[0].value) || 30);
+  } catch (err) {
+    console.error('সিঙ্ক ইন্টারভাল পড়তে সমস্যা হয়েছে, ডিফল্ট ৩০ সেকেন্ড ব্যবহার হচ্ছে:', err.message);
+  }
+  setTimeout(scheduleNextSync, seconds * 1000);
+}
+
+// সার্ভার চালু হওয়ার ৩০ সেকেন্ড পর প্রথমবার সিঙ্ক শুরু হবে
+setTimeout(scheduleNextSync, 30000);
+
+// ==================== অর্ডার ম্যানেজমেন্ট — হেল্পার ফাংশন ====================
+
+// একটা পেইজের নির্দিষ্ট টাইপ/প্রোভাইডারের ক্রেডেনশিয়াল বের করে — ডাটাবেজে না থাকলে .env থেকে ফলব্যাক করে
+async function getOrderApiCredential(pageId, type, provider) {
+  if (pageId) {
+    const result = await pool.query(
+      `SELECT * FROM order_api_credentials WHERE page_id = $1 AND type = $2 AND provider = $3 ORDER BY priority ASC LIMIT 1`,
+      [pageId, type, provider]
+    );
+    if (result.rows.length > 0) return result.rows[0];
+  }
+  if (type === 'courier' && provider === 'steadfast') {
+    if (process.env.STEADFAST_API_KEY) {
+      return { api_key: process.env.STEADFAST_API_KEY, secret_key: process.env.STEADFAST_SECRET_KEY };
+    }
+  }
+  if (type === 'ai' && provider === 'gemini') {
+    if (process.env.GEMINI_API_KEY) {
+      return { api_key: process.env.GEMINI_API_KEY };
+    }
+  }
+  return null;
+}
+
+// Gemini দিয়ে raw_text থেকে কাস্টমারের নাম/ফোন/ঠিকানা/টাকা বের করে
+async function extractOrderInfoWithAI(rawText, pageId) {
+  const cred = await getOrderApiCredential(pageId, 'ai', 'gemini');
+  if (!cred || !cred.api_key) {
+    throw new Error('AI (Gemini) API key সেট করা নেই — .env-এ GEMINI_API_KEY বসান');
+  }
+
+  const prompt = `নিচের বাংলা/ইংরেজি মিশ্রিত টেক্সট থেকে কাস্টমারের অর্ডারের তথ্য বের করে শুধু JSON আকারে দাও, অন্য কোনো লেখা/ব্যাখ্যা ছাড়া, ব্যাকটিক (\`\`\`) ছাড়া। ফরম্যাট:
+{"customer_name": "...", "customer_phone": "...", "customer_address": "...", "amount": সংখ্যা_অথবা_null}
+
+টেক্সট:
+"""
+${rawText}
+"""`;
+
+  const res = await fetch(
+    `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${cred.api_key}`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }] })
+    }
+  );
+  const data = await res.json();
+  const text = data.candidates?.[0]?.content?.parts?.[0]?.text;
+  if (!text) throw new Error('AI থেকে ঠিকভাবে উত্তর পাওয়া যায়নি');
+  const cleaned = text.replace(/```json|```/g, '').trim();
+  return JSON.parse(cleaned);
+}
+
+// Steadfast — নতুন কনসাইনমেন্ট তৈরি (কুরিয়ারে পাঠানো)
+async function steadfastCreateOrder(cred, entry) {
+  const res = await fetch('https://portal.packzy.com/api/v1/create_order', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Api-Key': cred.api_key,
+      'Secret-Key': cred.secret_key
+    },
+    body: JSON.stringify({
+      invoice: `MAYA-${entry.id}`,
+      recipient_name: entry.customer_name,
+      recipient_phone: entry.customer_phone,
+      recipient_address: entry.customer_address,
+      cod_amount: entry.amount || 0,
+      note: ''
+    })
+  });
+  return res.json();
+}
+
+// Steadfast — ফোন নাম্বার দিয়ে কাস্টমারের কুরিয়ার-হিস্ট্রি (ফ্রড চেক)
+async function steadfastFraudCheck(cred, phone) {
+  const res = await fetch(`https://portal.packzy.com/api/v1/fraud_check/${phone}`, {
+    headers: {
+      'content-type': 'application/json',
+      'api-key': cred.api_key,
+      'secret-key': cred.secret_key
+    }
+  });
+  return res.json();
+}
+
+// Steadfast — কনসাইনমেন্টের বর্তমান ডেলিভারি স্ট্যাটাস
+async function steadfastStatusCheck(cred, consignmentId) {
+  const res = await fetch(`https://portal.packzy.com/api/v1/status_by_cid/${consignmentId}`, {
+    headers: {
+      'content-type': 'application/json',
+      'api-key': cred.api_key,
+      'secret-key': cred.secret_key
+    }
+  });
+  return res.json();
+}
+
+// ==================== অর্ডার ম্যানেজমেন্ট — API রুট ====================
+
+// পেইজ/দোকান লিস্ট
+app.get('/api/order-pages', async (req, res) => {
+  try {
+    const result = await pool.query(`SELECT * FROM order_pages ORDER BY id ASC`);
+    res.json({ status: 'ok', pages: result.rows });
+  } catch (err) {
+    res.status(500).json({ status: 'error', message: err.message });
+  }
+});
+
+app.post('/api/order-pages', verifyAdmin, async (req, res) => {
+  try {
+    const { name } = req.body;
+    if (!name) return res.status(400).json({ status: 'error', message: 'পেইজের নাম দিতে হবে' });
+    const result = await pool.query(`INSERT INTO order_pages (name) VALUES ($1) RETURNING *`, [name]);
+    res.json({ status: 'ok', page: result.rows[0] });
+  } catch (err) {
+    res.status(500).json({ status: 'error', message: err.message });
+  }
+});
+
+// একটা পেইজের জন্য কুরিয়ার/AI ক্রেডেনশিয়াল সেট করুন
+app.post('/api/order-pages/:pageId/credentials', verifyAdmin, async (req, res) => {
+  try {
+    const { pageId } = req.params;
+    const { type, provider, api_key, secret_key } = req.body;
+    if (!type || !provider) {
+      return res.status(400).json({ status: 'error', message: 'type এবং provider দিতে হবে' });
+    }
+    const existing = await pool.query(
+      `SELECT id FROM order_api_credentials WHERE page_id = $1 AND type = $2 AND provider = $3 LIMIT 1`,
+      [pageId, type, provider]
+    );
+    let result;
+    if (existing.rows.length > 0) {
+      result = await pool.query(
+        `UPDATE order_api_credentials SET
+          api_key = COALESCE($1, api_key),
+          secret_key = COALESCE($2, secret_key)
+         WHERE id = $3 RETURNING *`,
+        [api_key || null, secret_key || null, existing.rows[0].id]
+      );
+    } else {
+      result = await pool.query(
+        `INSERT INTO order_api_credentials (page_id, type, provider, api_key, secret_key)
+         VALUES ($1, $2, $3, $4, $5) RETURNING *`,
+        [pageId, type, provider, api_key || null, secret_key || null]
+      );
+    }
+    res.json({ status: 'ok', credential: result.rows[0] });
+  } catch (err) {
+    res.status(500).json({ status: 'error', message: err.message });
+  }
+});
+
+// একটা পেইজের ক্রেডেনশিয়াল কী কী সেট করা আছে (নিরাপত্তার জন্য আসল মান না, শুধু "সেট করা আছে কিনা")
+app.get('/api/order-pages/:pageId/credentials', verifyAdmin, async (req, res) => {
+  try {
+    const { pageId } = req.params;
+    const result = await pool.query(
+      `SELECT type, provider,
+        (api_key IS NOT NULL AND api_key != '') AS has_api_key,
+        (secret_key IS NOT NULL AND secret_key != '') AS has_secret_key
+       FROM order_api_credentials WHERE page_id = $1`,
+      [pageId]
+    );
+    res.json({ status: 'ok', credentials: result.rows });
+  } catch (err) {
+    res.status(500).json({ status: 'error', message: err.message });
+  }
+});
+
+// নির্দিষ্ট গ্রুপের (pending/emergency/making) অর্ডারের লিস্ট — গত ৯০ দিনের মধ্যে
+app.get('/api/order-entries', verifyAuth, async (req, res) => {
+  try {
+    const group = req.query.group || 'pending';
+    const result = await pool.query(
+      `SELECT * FROM order_entries WHERE group_name = $1 AND created_at >= NOW() - INTERVAL '90 days' ORDER BY created_at DESC`,
+      [group]
+    );
+    res.json({ status: 'ok', entries: result.rows });
+  } catch (err) {
+    res.status(500).json({ status: 'error', message: err.message });
+  }
+});
+
+// প্রতিটা গ্রুপে কতগুলো অর্ডার আছে
+app.get('/api/order-entries/counts', verifyAuth, async (req, res) => {
+  try {
+    const result = await pool.query(`SELECT group_name, COUNT(*) FROM order_entries GROUP BY group_name`);
+    const counts = {};
+    result.rows.forEach((r) => { counts[r.group_name] = parseInt(r.count); });
+    res.json({ status: 'ok', counts });
+  } catch (err) {
+    res.status(500).json({ status: 'error', message: err.message });
+  }
+});
+
+// All Order — পেজিনেটেড (সব অর্ডারের পূর্ণ ইতিহাস, তাই একসাথে সব আনা হয় না)
+app.get('/api/order-entries/all-order-page', verifyAuth, async (req, res) => {
+  try {
+    const offset = parseInt(req.query.offset) || 0;
+    const limit = Math.min(50, parseInt(req.query.limit) || 20);
+    const result = await pool.query(
+      `SELECT * FROM order_entries WHERE group_name = 'all_order' ORDER BY created_at DESC LIMIT $1 OFFSET $2`,
+      [limit, offset]
+    );
+    const countResult = await pool.query(`SELECT COUNT(*) FROM order_entries WHERE group_name = 'all_order'`);
+    res.json({ status: 'ok', entries: result.rows, total: parseInt(countResult.rows[0].count) });
+  } catch (err) {
+    res.status(500).json({ status: 'error', message: err.message });
+  }
+});
+
+// নতুন অর্ডার পোস্ট করুন — All Order + Pending, দুটো কপি একসাথে তৈরি হয়
+app.post('/api/order-entries', verifyAuth, async (req, res) => {
+  try {
+    const { raw_text, image_urls, page_id } = req.body;
+    if (!raw_text || !raw_text.trim()) {
+      return res.status(400).json({ status: 'error', message: 'অর্ডারের তথ্য দিতে হবে' });
+    }
+    const batchId = crypto.randomUUID();
+    const moderatorName = req.user.name;
+
+    let pageName = null;
+    if (page_id) {
+      const pageResult = await pool.query(`SELECT name FROM order_pages WHERE id = $1`, [page_id]);
+      pageName = pageResult.rows[0]?.name || null;
+    }
+
+    // raw_text থেকে বাংলাদেশি ফোন নাম্বার প্যাটার্ন বের করার চেষ্টা (ডুপ্লিকেট-চেক ও রেফারেন্সের জন্য)
+    const phoneMatch = raw_text.match(/(01[3-9]\d{8})/);
+    const customerPhone = phoneMatch ? phoneMatch[1] : null;
+
+    let isDuplicate = false;
+    if (customerPhone) {
+      const dupResult = await pool.query(
+        `SELECT id FROM order_entries WHERE customer_phone = $1 AND status != 'sent' AND group_name = 'all_order'`,
+        [customerPhone]
+      );
+      isDuplicate = dupResult.rows.length > 0;
+    }
+
+    const imageUrlsJson = JSON.stringify(image_urls || []);
+
+    const allOrderResult = await pool.query(
+      `INSERT INTO order_entries (raw_text, image_urls, moderator, group_name, batch_id, page_id, page_name, status, customer_phone)
+       VALUES ($1, $2, $3, 'all_order', $4, $5, $6, 'pending', $7) RETURNING *`,
+      [raw_text, imageUrlsJson, moderatorName, batchId, page_id || null, pageName, customerPhone]
+    );
+    const pendingResult = await pool.query(
+      `INSERT INTO order_entries (raw_text, image_urls, moderator, group_name, batch_id, page_id, page_name, status, customer_phone)
+       VALUES ($1, $2, $3, 'pending', $4, $5, $6, 'pending', $7) RETURNING *`,
+      [raw_text, imageUrlsJson, moderatorName, batchId, page_id || null, pageName, customerPhone]
+    );
+
+    res.json({
+      status: 'ok',
+      all_order_entry: allOrderResult.rows[0],
+      pending_entry: pendingResult.rows[0],
+      is_duplicate: isDuplicate
+    });
+  } catch (err) {
+    res.status(500).json({ status: 'error', message: err.message });
+  }
+});
+
+// অর্ডার এডিট করুন — এডমিন সরাসরি, মডারেটর হলে অনুমোদনের জন্য জমা থাকে
+app.put('/api/order-entries/:id', verifyAuth, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { raw_text, image_urls } = req.body;
+
+    const entryResult = await pool.query(`SELECT * FROM order_entries WHERE id = $1`, [id]);
+    if (entryResult.rows.length === 0) {
+      return res.status(404).json({ status: 'error', message: 'অর্ডার পাওয়া যায়নি' });
+    }
+    const entry = entryResult.rows[0];
+
+    if (req.user.role === 'admin') {
+      // একই batch_id-এর সব কপি (All Order + Pending + Emergency ইত্যাদি) একসাথে আপডেট হবে
+      await pool.query(
+        `UPDATE order_entries SET raw_text = $1, image_urls = $2 WHERE batch_id = $3`,
+        [raw_text, JSON.stringify(image_urls || []), entry.batch_id]
+      );
+      res.json({ status: 'ok', message: 'আপডেট হয়েছে' });
+    } else {
+      await pool.query(
+        `INSERT INTO order_pending_edits (entry_id, submitted_by, proposed_raw_text, proposed_image_urls, original_raw_text, original_image_urls)
+         VALUES ($1, $2, $3, $4, $5, $6)
+         ON CONFLICT (entry_id, submitted_by) DO UPDATE SET
+           proposed_raw_text = EXCLUDED.proposed_raw_text,
+           proposed_image_urls = EXCLUDED.proposed_image_urls,
+           submitted_at = NOW()`,
+        [id, req.user.name, raw_text, JSON.stringify(image_urls || []), entry.raw_text, entry.image_urls]
+      );
+      res.json({ status: 'ok', message: 'এডিট অনুমোদনের জন্য পাঠানো হয়েছে' });
+    }
+  } catch (err) {
+    res.status(500).json({ status: 'error', message: err.message });
+  }
+});
+
+// অর্ডার ডিলিট করুন — এডমিন পাসওয়ার্ড দিয়ে সরাসরি, মডারেটর হলে অনুমোদনের জন্য জমা থাকে
+app.delete('/api/order-entries/:id', verifyAuth, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { password } = req.body;
+
+    const entryResult = await pool.query(`SELECT * FROM order_entries WHERE id = $1`, [id]);
+    if (entryResult.rows.length === 0) {
+      return res.status(404).json({ status: 'error', message: 'অর্ডার পাওয়া যায়নি' });
+    }
+    const entry = entryResult.rows[0];
+
+    if (req.user.role === 'admin') {
+      const deletePassword = process.env.ALL_ORDER_DELETE_PASSWORD || 'Maya';
+      if (password !== deletePassword) {
+        return res.status(403).json({ status: 'error', message: 'পাসওয়ার্ড ভুল' });
+      }
+      if (entry.status !== 'sent') {
+        await pool.query(
+          `INSERT INTO order_recycle_bin (original_group, raw_text, image_urls, moderator, page_id, page_name, status, customer_phone, delete_reason)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+          [entry.group_name, entry.raw_text, entry.image_urls, entry.moderator, entry.page_id, entry.page_name, entry.status, entry.customer_phone, 'admin_delete']
+        );
+      }
+      await pool.query(`DELETE FROM order_entries WHERE batch_id = $1`, [entry.batch_id]);
+      res.json({ status: 'ok', message: 'মুছে ফেলা হয়েছে' });
+    } else {
+      await pool.query(
+        `INSERT INTO order_pending_deletes (entry_id, submitted_by) VALUES ($1, $2) ON CONFLICT (entry_id) DO NOTHING`,
+        [id, req.user.name]
+      );
+      res.json({ status: 'ok', message: 'ডিলিট অনুমোদনের জন্য পাঠানো হয়েছে' });
+    }
+  } catch (err) {
+    res.status(500).json({ status: 'error', message: err.message });
+  }
+});
+
+// কুরিয়ারে পাঠান — প্রয়োজনে আগে AI দিয়ে নাম/ফোন/ঠিকানা/টাকা বের করে নেবে
+app.post('/api/order-entries/:id/send-courier', verifyAuth, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const entryResult = await pool.query(`SELECT * FROM order_entries WHERE id = $1`, [id]);
+    if (entryResult.rows.length === 0) {
+      return res.status(404).json({ status: 'error', message: 'অর্ডার পাওয়া যায়নি' });
+    }
+    const entry = entryResult.rows[0];
+
+    if (entry.status === 'sent') {
+      return res.status(400).json({ status: 'error', message: 'এই অর্ডার আগেই কুরিয়ারে পাঠানো হয়েছে' });
+    }
+
+    let { customer_name, customer_phone, customer_address, amount } = entry;
+    if (!customer_name || !customer_phone || !customer_address || amount === null) {
+      try {
+        const extracted = await extractOrderInfoWithAI(entry.raw_text, entry.page_id);
+        customer_name = customer_name || extracted.customer_name;
+        customer_phone = customer_phone || extracted.customer_phone;
+        customer_address = customer_address || extracted.customer_address;
+        amount = (amount !== null && amount !== undefined) ? amount : extracted.amount;
+        await pool.query(
+          `UPDATE order_entries SET customer_name = $1, customer_phone = $2, customer_address = $3, amount = $4 WHERE batch_id = $5`,
+          [customer_name, customer_phone, customer_address, amount, entry.batch_id]
+        );
+      } catch (aiErr) {
+        return res.status(400).json({ status: 'error', message: 'AI দিয়ে অর্ডারের তথ্য বের করা যায়নি: ' + aiErr.message });
+      }
+    }
+
+    if (!customer_name || !customer_phone || !customer_address) {
+      return res.status(400).json({
+        status: 'error',
+        message: 'কাস্টমারের নাম/ফোন/ঠিকানা সম্পূর্ণভাবে বের করা যায়নি — এডিট করে ম্যানুয়ালি ঠিক করে আবার চেষ্টা করুন'
+      });
+    }
+
+    const cred = await getOrderApiCredential(entry.page_id, 'courier', 'steadfast');
+    if (!cred || !cred.api_key || !cred.secret_key) {
+      return res.status(400).json({ status: 'error', message: 'কুরিয়ার (Steadfast) API key সেট করা নেই' });
+    }
+
+    const result = await steadfastCreateOrder(cred, { id: entry.id, customer_name, customer_phone, customer_address, amount });
+    if (result.status !== 200 || !result.consignment) {
+      return res.status(400).json({ status: 'error', message: 'কুরিয়ারে পাঠাতে সমস্যা হয়েছে', details: result });
+    }
+
+    const consignmentId = result.consignment.consignment_id;
+    const trackingCode = result.consignment.tracking_code;
+
+    // একই batch_id-এর সব কপিতে (All Order + Pending + Emergency) status='sent' মিরর হবে
+    await pool.query(
+      `UPDATE order_entries SET status = 'sent', consignment_id = $1, tracking_code = $2 WHERE batch_id = $3`,
+      [consignmentId, trackingCode, entry.batch_id]
+    );
+
+    res.json({ status: 'ok', consignment_id: consignmentId, tracking_code: trackingCode });
+  } catch (err) {
+    res.status(500).json({ status: 'error', message: err.message });
+  }
+});
+
+// Emergency গ্রুপে একটা কপি পাঠান (মূল কার্ড একই জায়গায় থেকে যায়)
+app.post('/api/order-entries/:id/emergency', verifyAuth, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const entryResult = await pool.query(`SELECT * FROM order_entries WHERE id = $1`, [id]);
+    if (entryResult.rows.length === 0) {
+      return res.status(404).json({ status: 'error', message: 'অর্ডার পাওয়া যায়নি' });
+    }
+    const entry = entryResult.rows[0];
+
+    const existing = await pool.query(
+      `SELECT id FROM order_entries WHERE batch_id = $1 AND group_name = 'emergency'`,
+      [entry.batch_id]
+    );
+    if (existing.rows.length > 0) {
+      return res.json({ status: 'ok', message: 'আগে থেকেই Emergency-তে আছে' });
+    }
+
+    await pool.query(
+      `INSERT INTO order_entries (raw_text, image_urls, moderator, group_name, batch_id, page_id, page_name, status, customer_phone, customer_name, customer_address, amount)
+       VALUES ($1, $2, $3, 'emergency', $4, $5, $6, $7, $8, $9, $10, $11)`,
+      [entry.raw_text, entry.image_urls, entry.moderator, entry.batch_id, entry.page_id, entry.page_name, entry.status, entry.customer_phone, entry.customer_name, entry.customer_address, entry.amount]
+    );
+    res.json({ status: 'ok', message: 'Emergency-তে যোগ হয়েছে' });
+  } catch (err) {
+    res.status(500).json({ status: 'error', message: err.message });
+  }
+});
+
+// এডমিন: অনুমোদনের অপেক্ষায় থাকা এডিটের লিস্ট
+app.get('/api/order-entries/pending-edits', verifyAdmin, async (req, res) => {
+  try {
+    const result = await pool.query(`SELECT * FROM order_pending_edits ORDER BY submitted_at DESC`);
+    res.json({ status: 'ok', pending_edits: result.rows });
+  } catch (err) {
+    res.status(500).json({ status: 'error', message: err.message });
+  }
+});
+
+app.post('/api/order-entries/pending-edits/:id/approve', verifyAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const editResult = await pool.query(`SELECT * FROM order_pending_edits WHERE id = $1`, [id]);
+    if (editResult.rows.length === 0) return res.status(404).json({ status: 'error', message: 'পাওয়া যায়নি' });
+    const edit = editResult.rows[0];
+
+    const entryResult = await pool.query(`SELECT * FROM order_entries WHERE id = $1`, [edit.entry_id]);
+    if (entryResult.rows.length === 0) return res.status(404).json({ status: 'error', message: 'মূল অর্ডার পাওয়া যায়নি' });
+    const entry = entryResult.rows[0];
+
+    await pool.query(
+      `UPDATE order_entries SET raw_text = $1, image_urls = $2 WHERE batch_id = $3`,
+      [edit.proposed_raw_text, edit.proposed_image_urls, entry.batch_id]
+    );
+    await pool.query(`DELETE FROM order_pending_edits WHERE id = $1`, [id]);
+    res.json({ status: 'ok' });
+  } catch (err) {
+    res.status(500).json({ status: 'error', message: err.message });
+  }
+});
+
+app.post('/api/order-entries/pending-edits/:id/decline', verifyAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    await pool.query(`DELETE FROM order_pending_edits WHERE id = $1`, [id]);
+    res.json({ status: 'ok' });
+  } catch (err) {
+    res.status(500).json({ status: 'error', message: err.message });
+  }
+});
+
+// এডমিন: অনুমোদনের অপেক্ষায় থাকা ডিলিটের লিস্ট
+app.get('/api/order-entries/pending-deletes', verifyAdmin, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT pd.*, e.raw_text, e.customer_phone, e.group_name
+       FROM order_pending_deletes pd
+       JOIN order_entries e ON e.id = pd.entry_id
+       ORDER BY pd.submitted_at DESC`
+    );
+    res.json({ status: 'ok', pending_deletes: result.rows });
+  } catch (err) {
+    res.status(500).json({ status: 'error', message: err.message });
+  }
+});
+
+app.post('/api/order-entries/pending-deletes/:id/approve', verifyAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const pdResult = await pool.query(`SELECT * FROM order_pending_deletes WHERE id = $1`, [id]);
+    if (pdResult.rows.length === 0) return res.status(404).json({ status: 'error', message: 'পাওয়া যায়নি' });
+    const pd = pdResult.rows[0];
+
+    const entryResult = await pool.query(`SELECT * FROM order_entries WHERE id = $1`, [pd.entry_id]);
+    if (entryResult.rows.length > 0) {
+      const entry = entryResult.rows[0];
+      if (entry.status !== 'sent') {
+        await pool.query(
+          `INSERT INTO order_recycle_bin (original_group, raw_text, image_urls, moderator, page_id, page_name, status, customer_phone, delete_reason)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+          [entry.group_name, entry.raw_text, entry.image_urls, entry.moderator, entry.page_id, entry.page_name, entry.status, entry.customer_phone, 'moderator_delete_approved']
+        );
+      }
+      await pool.query(`DELETE FROM order_entries WHERE batch_id = $1`, [entry.batch_id]);
+    }
+    await pool.query(`DELETE FROM order_pending_deletes WHERE id = $1`, [id]);
+    res.json({ status: 'ok' });
+  } catch (err) {
+    res.status(500).json({ status: 'error', message: err.message });
+  }
+});
+
+app.post('/api/order-entries/pending-deletes/:id/decline', verifyAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    await pool.query(`DELETE FROM order_pending_deletes WHERE id = $1`, [id]);
+    res.json({ status: 'ok' });
+  } catch (err) {
+    res.status(500).json({ status: 'error', message: err.message });
+  }
+});
+
+// ফোন নাম্বার দিয়ে ফ্রড চেক (কুরিয়ার হিস্ট্রি)
+app.get('/api/order-entries/fraud-check-phone', verifyAuth, async (req, res) => {
+  try {
+    const { phone, page_id } = req.query;
+    if (!phone) return res.status(400).json({ status: 'error', message: 'ফোন নাম্বার দিতে হবে' });
+    const cred = await getOrderApiCredential(page_id || null, 'courier', 'steadfast');
+    if (!cred || !cred.api_key) {
+      return res.status(400).json({ status: 'error', message: 'কুরিয়ার API key সেট করা নেই' });
+    }
+    const result = await steadfastFraudCheck(cred, phone);
+    res.json({ status: 'ok', result });
+  } catch (err) {
+    res.status(500).json({ status: 'error', message: err.message });
+  }
+});
+
+// একটা কনসাইনমেন্টের বর্তমান ডেলিভারি স্ট্যাটাস চেক করে ডাটাবেজে আপডেট করে
+app.post('/api/order-entries/:id/check-status', verifyAuth, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const entryResult = await pool.query(`SELECT * FROM order_entries WHERE id = $1`, [id]);
+    if (entryResult.rows.length === 0) {
+      return res.status(404).json({ status: 'error', message: 'অর্ডার পাওয়া যায়নি' });
+    }
+    const entry = entryResult.rows[0];
+    if (!entry.consignment_id) {
+      return res.status(400).json({ status: 'error', message: 'এই অর্ডার এখনো কুরিয়ারে পাঠানো হয়নি' });
+    }
+    const cred = await getOrderApiCredential(entry.page_id, 'courier', 'steadfast');
+    if (!cred || !cred.api_key) {
+      return res.status(400).json({ status: 'error', message: 'কুরিয়ার API key সেট করা নেই' });
+    }
+    const result = await steadfastStatusCheck(cred, entry.consignment_id);
+    if (result.delivery_status) {
+      await pool.query(
+        `UPDATE order_entries SET courier_status = $1, courier_status_updated_at = NOW() WHERE batch_id = $2`,
+        [result.delivery_status, entry.batch_id]
+      );
+    }
+    res.json({ status: 'ok', delivery_status: result.delivery_status });
+  } catch (err) {
+    res.status(500).json({ status: 'error', message: err.message });
+  }
+});
+
+const PORT = process.env.PORT || 5000;
+app.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
+});
