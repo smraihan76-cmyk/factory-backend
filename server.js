@@ -16,6 +16,7 @@ const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const crypto = require('crypto');
 const cheerio = require('cheerio');
+const puppeteer = require('puppeteer');
 
 const app = express();
 app.use(cors());
@@ -4349,6 +4350,50 @@ app.get('/api/order-entries/:id/tracking', verifyAuth, async (req, res) => {
     }
   } catch (err) {
     res.status(500).json({ status: 'error', message: err.message });
+  }
+});
+
+// ==================== আসল PDF জেনারেশন (Puppeteer) — ছবি না, সরাসরি টেক্সট-ভিত্তিক PDF ====================
+// html2canvas+jsPDF দিয়ে "ছবি তোলার" পুরনো পদ্ধতিতে রেজুলেশন/পাতা-ভাগ/কাটাকাটির সমস্যা বারবার হচ্ছিল।
+// এটা আসল Chrome ব্রাউজার ব্যবহার করে HTML থেকে সরাসরি PDF বানায় — বাংলা টেক্সট নিখুঁত থাকে (সিলেক্ট/কপি
+// করা যায়), পাতা-ভাগ Chrome নিজেই সঠিকভাবে করে, আর এটা vector/টেক্সট-ভিত্তিক বলে রেজুলেশনের সমস্যাই নেই।
+
+let puppeteerBrowser = null;
+async function getPuppeteerBrowser() {
+  // একবার চালু হলে ব্রাউজারটা মেমোরিতে রাখা হয়, প্রতিটা PDF-এর জন্য নতুন করে চালু করলে অনেক ধীর হতো
+  if (!puppeteerBrowser) {
+    puppeteerBrowser = await puppeteer.launch({
+      headless: 'new',
+      args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage']
+    });
+  }
+  return puppeteerBrowser;
+}
+
+app.post('/api/generate-pdf', verifyAuth, async (req, res) => {
+  let page;
+  try {
+    const { html, format, filename } = req.body;
+    if (!html) {
+      return res.status(400).json({ status: 'error', message: 'HTML কনটেন্ট দিতে হবে' });
+    }
+    const browser = await getPuppeteerBrowser();
+    page = await browser.newPage();
+    // ফন্ট (বাংলাসহ) লোড হওয়ার জন্য নেটওয়ার্ক নিষ্ক্রিয় হওয়া পর্যন্ত অপেক্ষা করা হচ্ছে
+    await page.setContent(html, { waitUntil: 'networkidle0', timeout: 30000 });
+    const pdfBuffer = await page.pdf({
+      format: format || 'A4',
+      printBackground: true,
+      margin: { top: '14mm', bottom: '14mm', left: '10mm', right: '10mm' }
+    });
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `attachment; filename="${(filename || 'document').replace(/[^\w\u0980-\u09FF-]/g, '_')}.pdf"`);
+    res.send(pdfBuffer);
+  } catch (err) {
+    console.error('PDF তৈরি করতে সমস্যা হয়েছে:', err.message);
+    res.status(500).json({ status: 'error', message: 'PDF তৈরি করতে সমস্যা হয়েছে: ' + err.message });
+  } finally {
+    if (page) await page.close().catch(() => {});
   }
 });
 
