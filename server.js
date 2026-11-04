@@ -224,6 +224,8 @@ async function initDb() {
   `);
   await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS is_partner BOOLEAN DEFAULT false;`);
   await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS photo_url TEXT;`);
+  // প্রতিটা ইউজারের নিজের সাজানো Quick actions-এর ক্রম
+  await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS quick_actions_order JSONB;`);
   await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS is_super_admin BOOLEAN DEFAULT false;`);
   // প্রথম এডমিন অ্যাকাউন্ট — না থাকলে অটোমেটিক তৈরি হবে
   const adminCheck = await pool.query(`SELECT id FROM users WHERE phone = '01775515571'`);
@@ -808,6 +810,33 @@ app.post('/api/auth/register', verifyAdmin, async (req, res) => {
 
 // সব ইউজারের লিস্ট — শুধু এডমিন দেখতে পারবে
 // নিজের সবশেষ প্রোফাইল তথ্য (নাম/ছবি) — অন্য ডিভাইসে বদলানো হলেও এখান থেকে তাজা তথ্য পাওয়া যাবে
+// Quick actions-এর সাজানো ক্রম — প্রতিটা ইউজারের নিজের, যেকোনো ডিভাইসে একই থাকবে
+app.get('/api/auth/me/quick-actions', verifyAuth, async (req, res) => {
+  try {
+    if (!req.user.id) return res.json({ status: 'ok', order: null });
+    const r = await pool.query(`SELECT quick_actions_order FROM users WHERE id = $1`, [req.user.id]);
+    res.json({ status: 'ok', order: r.rows[0]?.quick_actions_order || null });
+  } catch (err) {
+    res.status(500).json({ status: 'error', message: err.message });
+  }
+});
+
+app.put('/api/auth/me/quick-actions', verifyAuth, async (req, res) => {
+  try {
+    if (!req.user.id) return res.status(403).json({ status: 'error', message: 'এই কাজের অনুমতি নেই' });
+    const { order } = req.body;
+    // null = ডিফল্ট সাজানোয় ফেরত। ইনপুট যাচাই: শুধু ছোট স্ট্রিংয়ের অ্যারে
+    if (order !== null && !(Array.isArray(order) && order.length <= 100 && order.every((k) => typeof k === 'string' && k.length <= 100))) {
+      return res.status(400).json({ status: 'error', message: 'ক্রম ঠিক নয়' });
+    }
+    await pool.query(`UPDATE users SET quick_actions_order = $1 WHERE id = $2`,
+      [order === null ? null : JSON.stringify(order), req.user.id]);
+    res.json({ status: 'ok' });
+  } catch (err) {
+    res.status(500).json({ status: 'error', message: err.message });
+  }
+});
+
 app.get('/api/auth/me', verifyAuth, async (req, res) => {
   try {
     const result = await pool.query(
@@ -1038,7 +1067,9 @@ app.put('/api/partners/transactions/:id', verifyAuth, async (req, res) => {
 
     const newDescription = description || old.description;
     const newAmount = amount || old.amount;
-    const newImageUrl = image_url !== undefined ? image_url : old.image_url;
+    let newImageUrl = image_url !== undefined ? image_url : old.image_url;
+    // লগ থেকে আসা ছবির লিংক অপরিবর্তিত থাকলে সেটাকে আবার আসল ছবিতে বদলে নেওয়া হয় (লিংক যেন ছবি হিসেবে সেভ না হয়)
+    if (typeof newImageUrl === 'string' && /\/api\/partner-image\/\d+/.test(newImageUrl)) newImageUrl = old.image_url;
 
     const editReqResult = await pool.query(
       `INSERT INTO partner_edit_requests
@@ -1160,19 +1191,58 @@ app.get('/api/partners/expenses-all', async (req, res) => {
 // মেসেঞ্জার/হোয়াটসঅ্যাপের চ্যাটের মতো — পুরনো থেকে নতুন ক্রমে (উপর থেকে নিচে), নতুনটা সবার নিচে থাকে।
 // সবশেষ ৫০০টা এন্ট্রি আগে বের করে (DESC), তারপর সেগুলোকেই কালানুক্রমিক (ASC) সাজানো হচ্ছে —
 // এতে অনেক পুরনো ডেটা থাকলেও সাম্প্রতিক এন্ট্রি কখনো বাদ পড়বে না
+// সেভ করা ছবি (base64) সার্ভ করার সাধারণ ফাংশন
+function sendStoredImage(res, img) {
+  if (!img) return res.status(404).end();
+  const m = img.match(/^data:([^;]+);base64,([\s\S]*)$/);
+  if (!m) return res.redirect(img);
+  res.set('Content-Type', m[1]);
+  res.set('Cache-Control', 'private, max-age=86400');
+  res.send(Buffer.from(m[2], 'base64'));
+}
+function imageTokenOk(req) {
+  try { verifyTokenLenient(String(req.query.token || '')); return true; } catch (e) { return false; }
+}
+app.get('/api/partner-image/:id', async (req, res) => {
+  try {
+    if (!imageTokenOk(req)) return res.status(401).end();
+    const r = await pool.query(`SELECT image_url FROM partner_transactions WHERE id = $1`, [parseInt(req.params.id)]);
+    sendStoredImage(res, r.rows[0] && r.rows[0].image_url);
+  } catch (err) { res.status(500).end(); }
+});
+app.get('/api/user-photo/:id', async (req, res) => {
+  try {
+    if (!imageTokenOk(req)) return res.status(401).end();
+    const r = await pool.query(`SELECT photo_url FROM users WHERE id = $1`, [parseInt(req.params.id)]);
+    sendStoredImage(res, r.rows[0] && r.rows[0].photo_url);
+  } catch (err) { res.status(500).end(); }
+});
+
+// পার্টনার লগ — একদম শুরু থেকে শেষ পর্যন্ত সব এন্ট্রি (কোনো সীমা নেই)।
+// আগে শুধু শেষ ৫০০টা আসত। সব ইতিহাস দিলেও যেন ধীর না হয়, তাই ছবি (রশিদ ও প্রোফাইল ছবি) পুরো ডেটা হিসেবে না পাঠিয়ে
+// ছোট লিংক হিসেবে পাঠানো হয় — ব্রাউজার ছবিগুলো আলাদা করে লোড ও ক্যাশ করে
 app.get('/api/partners/all-transactions', verifyAuthOptional, async (req, res) => {
   try {
     const result = await pool.query(
-      `SELECT * FROM (
-         SELECT pt.*, u.name AS added_by_name, u.photo_url AS added_by_photo
-         FROM partner_transactions pt
-         JOIN users u ON u.id = pt.added_by_user_id
-         ORDER BY pt.event_time DESC, pt.created_at DESC
-         LIMIT 500
-       ) recent
-       ORDER BY event_time ASC, created_at ASC`
+      `SELECT pt.id, pt.user_id, pt.type, pt.description, pt.amount, pt.added_by_user_id,
+              (pt.image_url IS NOT NULL AND pt.image_url <> '') AS has_image,
+              CASE WHEN pt.image_url LIKE 'data:%' THEN NULL ELSE pt.image_url END AS plain_image_url,
+              pt.linked_staff_payment_id, pt.linked_expense_id, pt.event_time, pt.created_at,
+              u.name AS added_by_name, (u.photo_url IS NOT NULL AND u.photo_url <> '') AS has_photo
+       FROM partner_transactions pt
+       JOIN users u ON u.id = pt.added_by_user_id
+       ORDER BY pt.event_time ASC, pt.created_at ASC`
     );
-    const withReactions = await attachReactions(result.rows, req.user ? req.user.id : null);
+    const authHeader = req.headers.authorization || '';
+    const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : '';
+    const base = publicBaseUrl(req);
+    const q = token ? `?token=${encodeURIComponent(token)}` : '';
+    const rows = result.rows.map(({ has_image, plain_image_url, has_photo, ...r }) => ({
+      ...r,
+      image_url: has_image ? (plain_image_url || `${base}/api/partner-image/${r.id}${q}`) : null,
+      added_by_photo: has_photo ? `${base}/api/user-photo/${r.added_by_user_id}${q}` : null
+    }));
+    const withReactions = await attachReactions(rows, req.user ? req.user.id : null);
     res.json({ status: 'ok', transactions: withReactions });
   } catch (err) {
     res.status(500).json({ status: 'error', message: err.message });
@@ -1602,6 +1672,14 @@ async function computeSalaryBreakdown(staffId, days) {
     if (!byDate[d]) byDate[d] = [];
     byDate[d].push(ev);
   }
+  // মার্ক বাদ দেওয়ার আগের আসল হাজিরা — "উপস্থিত ছিলেন, পরে অনুপস্থিত দেখানো হয়েছে" দিনের কাটা টাকা বের করতে লাগে
+  const rawByDate = {};
+  for (const ev of eventsResult.rows) {
+    const d = bdDateStr(ev.event_time);
+    if (!rawByDate[d]) rawByDate[d] = [];
+    rawByDate[d].push(ev);
+  }
+  let totalManualAbsentDeduction = 0;
 
   const joining = new Date(staff.joining_date);
   const displayRangeStart = new Date();
@@ -1641,6 +1719,22 @@ async function computeSalaryBreakdown(staffId, days) {
         if (inDisplayWindow) breakdown.push({ date: dateStr, status: 'offline', late_minutes: 0, day_earned: 0 });
         continue;
       }
+      // শুক্রবার সাধারণত পূর্ণ বেতনসহ ছুটি। কিন্তু এডমিন ম্যানুয়ালি কোনো শিফট "অনুপস্থিত" মার্ক করলে সেই শিফটের
+      // (অর্ধেক দিনের) বেতন যুক্ত হয় না; দুই শিফটই মার্ক হলে পুরো দিন অনুপস্থিত, বেতন নেই
+      const fridayMarked = [1, 2].filter((sh) => absentMarks[`${staffId}|${dateStr}|${sh}`]);
+      if (fridayMarked.length > 0) {
+        const deduction = fridayMarked.length * dayHalfDailyRate;
+        const earned = dayDailyRate - deduction;
+        if (fridayMarked.length === 2) {
+          absentDaysCount++;
+          if (inDisplayWindow) breakdown.push({ date: dateStr, status: 'absent', late_minutes: 0, day_earned: 0, is_friday: true, manual_absent: fridayMarked });
+        } else {
+          holidayDaysCount++;
+          totalEarned += earned;
+          if (inDisplayWindow) breakdown.push({ date: dateStr, status: 'holiday', late_minutes: 0, day_earned: +earned.toFixed(2), is_friday: true, manual_absent: fridayMarked });
+        }
+        continue;
+      }
       holidayDaysCount++;
       if (inDisplayWindow) breakdown.push({ date: dateStr, status: 'holiday', late_minutes: 0, day_earned: +dayDailyRate.toFixed(2) });
       totalEarned += dayDailyRate;
@@ -1678,9 +1772,26 @@ async function computeSalaryBreakdown(staffId, days) {
       shift2Start, shift2End, shift2WindowEnd, dayHalfDailyRate
     );
 
+    // ম্যানুয়ালি "অনুপস্থিত" মার্ক করা শিফট থাকলে — মার্ক না থাকলে ওই শিফটে আসলে কত বেতন যুক্ত হতো, সেটাই এখন কাটা গেল
+    const markedShifts = [1, 2].filter((sh) => absentMarks[`${staffId}|${dateStr}|${sh}`]);
+    let manualDeduction = 0;
+    if (markedShifts.length > 0) {
+      const rawEvents = rawByDate[dateStr] || [];
+      const r1In = rawEvents.find((e) => e.shift === 1 && e.event_type === 'check_in');
+      const r1Out = rawEvents.find((e) => e.shift === 1 && e.event_type === 'check_out');
+      const r2In = rawEvents.find((e) => e.shift === 2 && e.event_type === 'check_in');
+      const r2Out = rawEvents.find((e) => e.shift === 2 && e.event_type === 'check_out');
+      const raw1 = computeShiftOutcome(r1In ? new Date(r1In.event_time) : null, r1Out ? new Date(r1Out.event_time) : null, shift1Start, shift1End, shift1WindowEnd, dayHalfDailyRate);
+      const raw2 = computeShiftOutcome(r2In ? new Date(r2In.event_time) : null, r2Out ? new Date(r2Out.event_time) : null, shift2Start, shift2End, shift2WindowEnd, dayHalfDailyRate);
+      if (markedShifts.includes(1)) manualDeduction += raw1.pay;
+      if (markedShifts.includes(2)) manualDeduction += raw2.pay;
+      totalManualAbsentDeduction += manualDeduction;
+    }
+    const manualFields = markedShifts.length > 0 ? { manual_absent: markedShifts, manual_absent_deduction: +manualDeduction.toFixed(2) } : {};
+
     if (!shift1Outcome.attended && !shift2Outcome.attended) {
       absentDaysCount++;
-      if (inDisplayWindow) breakdown.push({ date: dateStr, status: 'absent', late_minutes: 0, day_earned: 0, shift1: shift1Outcome, shift2: shift2Outcome });
+      if (inDisplayWindow) breakdown.push({ date: dateStr, status: 'absent', late_minutes: 0, day_earned: 0, shift1: shift1Outcome, shift2: shift2Outcome, ...manualFields });
       continue;
     }
 
@@ -1696,7 +1807,8 @@ async function computeSalaryBreakdown(staffId, days) {
         late_minutes: totalLateMinutes,
         day_earned: +dayEarned.toFixed(2),
         shift1: shift1Outcome,
-        shift2: shift2Outcome
+        shift2: shift2Outcome,
+        ...manualFields
       });
     }
   }
@@ -1747,6 +1859,7 @@ async function computeSalaryBreakdown(staffId, days) {
     offline_days: offlineDaysCount,
     holiday_days: holidayDaysCount,
     total_late_minutes: totalLateMinutesSum,
+    total_manual_absent_deduction: +totalManualAbsentDeduction.toFixed(2),
     breakdown,
     overtime,
     total_overtime_amount: +totalOvertimeAmount.toFixed(2)
