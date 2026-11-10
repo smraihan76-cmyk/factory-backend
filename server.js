@@ -413,6 +413,16 @@ async function initDb() {
     );
   `);
   await pool.query(`ALTER TABLE wholesaler_ledger ADD COLUMN IF NOT EXISTS added_by_user_id INTEGER REFERENCES users(id);`);
+  // পাইকারি লগের প্রতিটা এন্ট্রিতে লাভ রিয়েক্ট
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS wholesaler_ledger_reactions (
+      id SERIAL PRIMARY KEY,
+      ledger_id INTEGER NOT NULL REFERENCES wholesaler_ledger(id) ON DELETE CASCADE,
+      user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+      UNIQUE (ledger_id, user_id)
+    );
+  `);
 
   // স্টাফের আগের (পুরনো) হিসাব সমন্বয় — signed amount: পজিটিভ মানে কারিগর পাবে (পাওনা বাড়বে), নেগেটিভ মানে ফ্যাক্টরি পাবে (পাওনা কমবে)
   await pool.query(`
@@ -3157,7 +3167,7 @@ app.put('/api/wholesalers/rates/:rateId', async (req, res) => {
 // ==================== পাইকারি হিসাব (লেজার) ====================
 
 // একজন পাইকারের সব এন্ট্রি (হিসাব যোগ + রিটার্ন + পেমেন্ট) — লগ আকারে
-app.get('/api/wholesalers/:id/ledger', async (req, res) => {
+app.get('/api/wholesalers/:id/ledger', verifyAuthOptional, async (req, res) => {
   try {
     const { id } = req.params;
     const result = await pool.query(
@@ -3168,7 +3178,28 @@ app.get('/api/wholesalers/:id/ledger', async (req, res) => {
        ORDER BY wl.event_time DESC, wl.created_at DESC`,
       [id]
     );
-    res.json({ status: 'ok', ledger: result.rows });
+    const reactRes = await pool.query(
+      `SELECT r.ledger_id, r.user_id, u.name AS user_name
+       FROM wholesaler_ledger_reactions r
+       JOIN users u ON u.id = r.user_id
+       JOIN wholesaler_ledger wl ON wl.id = r.ledger_id
+       WHERE wl.wholesaler_id = $1
+       ORDER BY r.created_at ASC`,
+      [id]
+    );
+    const byLedger = {};
+    for (const r of reactRes.rows) (byLedger[r.ledger_id] = byLedger[r.ledger_id] || []).push(r);
+    const viewerId = req.user ? req.user.id : null;
+    const ledger = result.rows.map((row) => {
+      const rs = byLedger[row.id] || [];
+      return {
+        ...row,
+        reaction_count: rs.length,
+        reacted_by_me: viewerId ? rs.some((r) => r.user_id === viewerId) : false,
+        reactors: rs.map((r) => ({ name: r.user_name }))
+      };
+    });
+    res.json({ status: 'ok', ledger });
   } catch (err) {
     res.status(500).json({ status: 'error', message: err.message });
   }
@@ -3331,6 +3362,32 @@ app.put('/api/wholesalers/ledger/:entryId', async (req, res) => {
 });
 
 // একটা লেজার এন্ট্রি ডিলিট করুন
+// লগ এন্ট্রিতে লাভ রিয়েক্ট — আবার চাপলে সরে যাবে
+app.post('/api/wholesalers/ledger/:entryId/react', verifyAuth, async (req, res) => {
+  try {
+    const { entryId } = req.params;
+    if (!req.user.id) return res.status(403).json({ status: 'error', message: 'এই কাজের অনুমতি নেই' });
+    const exists = await pool.query(`SELECT id FROM wholesaler_ledger WHERE id = $1`, [entryId]);
+    if (exists.rows.length === 0) return res.status(404).json({ status: 'error', message: 'এন্ট্রি পাওয়া যায়নি' });
+    const existing = await pool.query(
+      `SELECT id FROM wholesaler_ledger_reactions WHERE ledger_id = $1 AND user_id = $2`,
+      [entryId, req.user.id]
+    );
+    if (existing.rows.length > 0) {
+      await pool.query(`DELETE FROM wholesaler_ledger_reactions WHERE id = $1`, [existing.rows[0].id]);
+    } else {
+      await pool.query(`INSERT INTO wholesaler_ledger_reactions (ledger_id, user_id) VALUES ($1, $2)`, [entryId, req.user.id]);
+    }
+    const rs = await pool.query(
+      `SELECT u.name FROM wholesaler_ledger_reactions r JOIN users u ON u.id = r.user_id WHERE r.ledger_id = $1 ORDER BY r.created_at ASC`,
+      [entryId]
+    );
+    res.json({ status: 'ok', reaction_count: rs.rows.length, reacted_by_me: existing.rows.length === 0, reactors: rs.rows.map((r) => ({ name: r.name })) });
+  } catch (err) {
+    res.status(500).json({ status: 'error', message: err.message });
+  }
+});
+
 app.delete('/api/wholesalers/ledger/:entryId', async (req, res) => {
   try {
     const { entryId } = req.params;
