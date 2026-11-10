@@ -3194,6 +3194,8 @@ app.get('/api/wholesalers/:id/summary', async (req, res) => {
       status: 'ok',
       summary: {
         total_value: +totalValue.toFixed(2),
+        total_add: +addTotal.toFixed(2),
+        total_return: +returnTotal.toFixed(2),
         total_paid: +paidTotal.toFixed(2),
         current_due: +currentDue.toFixed(2)
       }
